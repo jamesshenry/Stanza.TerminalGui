@@ -24,6 +24,12 @@ partial class MyView : IStanzaView<TestNamespace.MyViewModel>
         }
     }
 
+    object? IStanzaView.ViewModel 
+    { 
+        get => ViewModel; 
+        set => ViewModel = (TestNamespace.MyViewModel?)value; 
+    }
+
     partial void OnApplyBindings(BindingContext context);
     private void ApplyBindings()
     {

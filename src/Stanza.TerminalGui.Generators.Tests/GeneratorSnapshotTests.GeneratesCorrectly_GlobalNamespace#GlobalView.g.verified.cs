@@ -23,6 +23,12 @@ partial class GlobalView : IStanzaView<GlobalViewModel>
         }
     }
 
+    object? IStanzaView.ViewModel 
+    { 
+        get => ViewModel; 
+        set => ViewModel = (GlobalViewModel?)value; 
+    }
+
     partial void OnApplyBindings(BindingContext context);
     private void ApplyBindings()
     {

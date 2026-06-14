@@ -43,11 +43,16 @@ public static class Emitter
         }
     }
 
-    partial void OnApplyBindings(BindingContext context);
+    object? IStanzaView.ViewModel 
+    { 
+        get => ViewModel; 
+        set => ViewModel = ({{view.ViewModelType}}?)value; 
+    }
 
+    partial void OnApplyBindings(BindingContext context);
 """
         );
-
+        sb.AppendLine();
         // Binding Method Start
         sb.AppendLine("    private void ApplyBindings()");
         sb.AppendLine("    {");
