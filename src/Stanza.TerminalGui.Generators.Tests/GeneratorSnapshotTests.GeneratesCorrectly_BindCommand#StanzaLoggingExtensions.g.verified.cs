@@ -34,7 +34,7 @@ internal sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
         global::Microsoft.Extensions.Logging.LoggerExtensions.LogError(logger, exception, message);
     }
 }
-public static class StanzaLoggingExtensions
+internal static class StanzaLoggingExtensions
 {
     /// <summary>
     /// Wires Stanza's internal logging into the application's MEL pipeline.
