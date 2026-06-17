@@ -30,7 +30,7 @@ public partial class SimpleFormView : View
     }
 }
 
-public class E2EStanzaTests
+public class GeneratedViewE2ETests
 {
     [Test]
     public async Task View_Initializes_Successfully()

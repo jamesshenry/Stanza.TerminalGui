@@ -17,23 +17,39 @@ partial class MyView : IStanzaView<TestNamespace.MyViewModel>
         set
         {
             if (object.ReferenceEquals(_viewModel, value)) return;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel changed on MyView", LogLevel.Debug);
             _viewModel = value;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel attached to MyView", LogLevel.Info); 
             ApplyBindings();
         }
+    }
+
+    object? IStanzaView.ViewModel 
+    { 
+        get => ViewModel; 
+        set => ViewModel = (TestNamespace.MyViewModel?)value; 
     }
 
     partial void OnApplyBindings(BindingContext context);
     private void ApplyBindings()
     {
+        StanzaConfig.Trace("[Lifecycle] Disposing old bindings for MyView", LogLevel.Debug);
         _bindingContext.Dispose();
         _bindingContext = new BindingContext();
-        if (_viewModel == null) return;
+        if (_viewModel == null)
+        {
+            StanzaConfig.Trace("[Lifecycle] ViewModel is null for MyView, skipping bindings.", LogLevel.Debug);
+            return;
+        }
+        StanzaConfig.Trace("[Lifecycle] Applying 0 bindings for MyView...", LogLevel.Debug);
 
+        StanzaConfig.Trace("[Lifecycle] Bindings applied successfully for MyView.", LogLevel.Debug);
         OnApplyBindings(_bindingContext);
     }
 
     protected override void Dispose(bool disposing)
     {
+        StanzaConfig.Trace($"[Lifecycle] Disposing MyView (disposing: {disposing})", LogLevel.Debug);
         if (disposing) _bindingContext.Dispose();
         base.Dispose(disposing);
     }

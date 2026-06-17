@@ -133,3 +133,13 @@ public sealed class BindCommandAttribute : StanzaBindingAttribute
     public BindCommandAttribute(string viewModelPropertyName)
         : base(viewModelPropertyName) { }
 }
+
+public sealed class BindListAttribute : StanzaBindingAttribute
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="BindListAttribute"/> class.
+    /// </summary>
+    /// <param name="viewModelPropertyName">The name of the <c>ICommand</c> property on the ViewModel.</param>
+    public BindListAttribute(string viewModelPropertyName)
+        : base(viewModelPropertyName) { }
+}

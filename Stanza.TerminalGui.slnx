@@ -1,9 +1,12 @@
 <Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="Directory.Packages.props" />
+  </Folder>
   <Folder Name="/src/">
-    <Project Path="src/Stanza.TerminalGui/Stanza.TerminalGui.csproj" />
-    <Project Path="src/Stanza.TerminalGui.Tests/Stanza.TerminalGui.Tests.csproj" />
-    <Project Path="src/Stanza.TerminalGui.Generators/Stanza.TerminalGui.Generators.csproj" />
     <Project Path="src/Stanza.TerminalGui.Generators.Tests/Stanza.TerminalGui.Generators.Tests.csproj" />
+    <Project Path="src/Stanza.TerminalGui.Generators/Stanza.TerminalGui.Generators.csproj" />
+    <Project Path="src/Stanza.TerminalGui.Tests/Stanza.TerminalGui.Tests.csproj" />
+    <Project Path="src/Stanza.TerminalGui/Stanza.TerminalGui.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/Stanza.TerminalGui.ClusterExplorer/Stanza.TerminalGui.ClusterExplorer.csproj" />

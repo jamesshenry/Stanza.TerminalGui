@@ -1,0 +1,4300 @@
+  - Stanza.TerminalGui
+  - Stanza.TerminalGui.Generators
+  - Stanza.TerminalGui.Generators.Tests
+  - Stanza.TerminalGui.Tests
+    - Binding
+    - Logging
+
+# --- Start of Code Files ---
+
+
+// File: src\Stanza.TerminalGui\Binding\BindingContext.cs
+
+```csharp
+namespace Stanza.TerminalGui;
+
+/// <summary>
+/// Manages the lifecycle of multiple data bindings and event subscriptions.
+/// Primarily used by generated views to ensure that all ViewModel subscriptions
+/// are cleanly released during a ViewModel swap or View disposal.
+/// </summary>
+/// <remarks>
+/// This class is not thread-safe for additions, but ensures that all managed
+/// <see cref="IDisposable"/> objects are invoked exactly once during cleanup.
+/// </remarks>
+public class BindingContext : IDisposable
+{
+    private readonly List<IDisposable> _bindings = new();
+    private bool _disposed;
+
+    /// <summary>
+    /// Registers a new binding or subscription to be managed by this context.
+    /// </summary>
+    /// <param name="binding">The disposable token representing the active binding.</param>
+    /// <exception cref="ObjectDisposedException">Thrown if attempting to add a binding to a disposed context.</exception>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="binding"/> is null.</exception>
+    public void AddBinding(IDisposable binding)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(binding);
+
+        _bindings.Add(binding);
+    }
+
+    /// <summary>
+    /// Disposes all registered bindings and clears the internal tracking list.
+    /// Once called, the context is considered inactive.
+    /// </summary>
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            foreach (var binding in _bindings)
+            {
+                binding.Dispose();
+            }
+            _bindings.Clear();
+            _disposed = true;
+            GC.SuppressFinalize(this);
+        }
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui\Binding\BindingContextExtensions.cs
+
+```csharp
+namespace Stanza.TerminalGui;
+
+/// <summary>
+/// Provides fluent extension methods for managing the lifecycle of disposables
+/// within a <see cref="BindingContext"/>.
+/// </summary>
+public static class BindingContextExtensions
+{
+    /// <summary>
+    /// Fluently registers a disposable binding, command, or subscription into a <see cref="BindingContext"/>.
+    /// </summary>
+    /// <remarks>
+    /// This is the primary way to manually attach subscriptions to a view's lifecycle
+    /// inside <c>OnInitialized</c> or custom view logic.
+    /// </remarks>
+    /// <typeparam name="TDisposable">The specific type of the disposable being registered.</typeparam>
+    /// <param name="disposable">The disposable object (e.g., a binding token returned by <see cref="BindingExtensions.Bind"/>).</param>
+    /// <param name="context">The context that will manage this object's lifecycle. Typically <c>this.BindingContext</c>.</param>
+    /// <returns>The original <paramref name="disposable"/> instance for further chaining.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="context"/> or <paramref name="disposable"/> is <see langword="null"/>.</exception>
+    /// <example>
+    /// <code>
+    /// ViewModel.Bind(() => ViewModel.Name, n => Title = n).AddTo(BindingContext);
+    /// </code>
+    /// </example>
+    public static TDisposable AddTo<TDisposable>(
+        this TDisposable disposable,
+        BindingContext context
+    )
+        where TDisposable : IDisposable
+    {
+        ArgumentNullException.ThrowIfNull(disposable);
+        ArgumentNullException.ThrowIfNull(context);
+
+        context.AddBinding(disposable);
+        return disposable;
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui\Binding\BindingExtensions.cs
+
+```csharp
+using System.Collections.Specialized;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using System.Windows.Input;
+using Terminal.Gui;
+using Terminal.Gui.App;
+using Terminal.Gui.ViewBase;
+using Terminal.Gui.Views;
+
+[assembly: InternalsVisibleTo("Stanza.TerminalGui.Tests")]
+
+namespace Stanza.TerminalGui;
+
+/// <summary>
+/// Provides high-performance, reflection-free extension methods for binding
+/// ViewModel properties to Terminal.Gui Views.
+/// </summary>
+/// <remarks>
+/// These methods are designed to be NativeAOT compatible by avoiding runtime reflection
+/// and utilizing compile-time captured member names via <see cref="CallerArgumentExpressionAttribute"/>.
+/// </remarks>
+public static class BindingExtensions
+{
+    /// <summary>
+    /// Establishes a thread-safe, one-way binding between a ViewModel property and a UI update action.
+    /// Automatically marshals property updates to the Terminal.Gui Main Loop using the provided <paramref name="view"/>.
+    /// </summary>
+    /// <typeparam name="TViewModel">The type of the ViewModel, which must implement <see cref="INotifyPropertyChanged"/>.</typeparam>
+    /// <typeparam name="TValue">The type of the property value being bound.</typeparam>
+    /// <param name="viewModel">The ViewModel instance containing the source property.</param>
+    /// <param name="view">The <see cref="View"/> used to access the application main loop for thread-safe UI updates.</param>
+    /// <param name="propertyExpression">A lambda expression used to retrieve the current property value from the ViewModel.</param>
+    /// <param name="updateUi">An action executed on the UI thread whenever the property value changes.</param>
+    /// <param name="expression">The string representation of the property expression, automatically captured at compile-time via <see cref="CallerArgumentExpressionAttribute"/>.</param>
+    /// <returns>An <see cref="IDisposable"/> that removes the property change subscription and stops UI synchronization when disposed.</returns>
+    public static IDisposable Bind<TViewModel, TValue>(
+        this View view,
+        TViewModel viewModel,
+        Func<TViewModel, TValue> propertyExpression,
+        Action<TValue> updateUi,
+        [CallerArgumentExpression(nameof(propertyExpression))] string? expression = null
+    )
+        where TViewModel : INotifyPropertyChanged
+    {
+        string propertyName = ExtractPropertyName(expression);
+
+        PropertyChangedEventHandler handler = (sender, e) =>
+        {
+            if (string.Equals(e.PropertyName, propertyName, StringComparison.Ordinal))
+            {
+                var newValue = propertyExpression(viewModel);
+                StanzaConfig.Trace($"[Binding] VM -> UI: {propertyName} = {newValue}");
+
+                if (view.App != null)
+                    view.App.Invoke(() => updateUi(newValue));
+                else
+                    updateUi(newValue);
+            }
+        };
+
+        viewModel.PropertyChanged += handler;
+
+        var initialValue = propertyExpression(viewModel);
+        if (view.App != null)
+            view.App.Invoke(() => updateUi(initialValue));
+        else
+            updateUi(initialValue);
+
+        return new DisposableAction(() => viewModel.PropertyChanged -= handler);
+    }
+
+    /// <summary>
+    /// Binds an <see cref="ICommand"/> to a Terminal.Gui <see cref="Button"/>.
+    /// Synchronizes the button's <see cref="View.Enabled"/> state with <see cref="ICommand.CanExecute"/>
+    /// and triggers <see cref="ICommand.Execute"/> when the button is accepted.
+    /// </summary>
+    /// <param name="command">The command to execute.</param>
+    /// <param name="button">The target button that will trigger the command and reflect its enabled state.</param>
+    /// <returns>An <see cref="IDisposable"/> that unhooks the command and button events when disposed.</returns>
+    public static IDisposable BindCommand(this Button button, ICommand command)
+    {
+        void UpdateEnabled(object? s, EventArgs e)
+        {
+            if (button.App != null)
+                button.App.Invoke(() => button.Enabled = command.CanExecute(null)); // Safe marshal [1]
+            else
+                button.Enabled = command.CanExecute(null);
+        }
+
+        void OnAccept(object? s, EventArgs e) => command.Execute(null);
+
+        command.CanExecuteChanged += UpdateEnabled;
+        button.Accepting += OnAccept;
+
+        UpdateEnabled(null, EventArgs.Empty);
+
+        return new DisposableAction(() =>
+        {
+            command.CanExecuteChanged -= UpdateEnabled;
+            button.Accepting -= OnAccept;
+        });
+    }
+
+    /// <summary>
+    /// Establishes a thread-safe, two-way binding between a ViewModel property and a UI element.
+    /// </summary>
+    public static IDisposable BindTwoWay<TViewModel, TValue>(
+        this View view,
+        TViewModel viewModel,
+        Func<TViewModel, TValue> vmGetter,
+        Action<TValue> vmSetter,
+        Func<Action, IDisposable> subscribeUiChange,
+        Func<TValue> uiGetter,
+        Action<TValue> uiSetter,
+        [CallerArgumentExpression(nameof(vmGetter))] string? expression = null
+    )
+        where TViewModel : INotifyPropertyChanged
+    {
+        string propertyName = ExtractPropertyName(expression);
+        bool updating = false;
+
+        var vmToUi = view.Bind(
+            viewModel,
+            vmGetter,
+            val =>
+            {
+                if (updating)
+                    return;
+                updating = true;
+                try
+                {
+                    uiSetter(val);
+                }
+                finally
+                {
+                    updating = false;
+                }
+            },
+            expression
+        );
+
+        var uiHandler = new Action(() =>
+        {
+            if (updating)
+                return;
+
+            var newVal = uiGetter();
+            if (EqualityComparer<TValue>.Default.Equals(newVal, vmGetter(viewModel)))
+                return;
+
+            updating = true;
+            try
+            {
+                vmSetter(newVal);
+            }
+            finally
+            {
+                updating = false;
+            }
+        });
+
+        var uiSub = subscribeUiChange(uiHandler);
+
+        return new DisposableAction(() =>
+        {
+            vmToUi.Dispose();
+            uiSub.Dispose();
+        });
+    }
+
+    public static IDisposable OnEvent<TArgs>(
+        this View view,
+        Action<EventHandler<TArgs>> subscribe,
+        Action<EventHandler<TArgs>> unsubscribe,
+        Action<TArgs> handler
+    )
+    {
+        EventHandler<TArgs> wrapper = (s, e) => handler(e);
+        subscribe(wrapper);
+        return new DisposableAction(() => unsubscribe(wrapper));
+    }
+
+    public static IDisposable OnCollectionChanged(
+        this INotifyCollectionChanged collection,
+        NotifyCollectionChangedEventHandler handler
+    )
+    {
+        collection.CollectionChanged += handler;
+        return new DisposableAction(() => collection.CollectionChanged -= handler);
+    }
+
+    public static IDisposable OnPropertyChanged(
+        this INotifyPropertyChanged viewModel,
+        string propertyName,
+        Action handler
+    )
+    {
+        PropertyChangedEventHandler wrapper = (s, e) =>
+        {
+            if (e.PropertyName == propertyName)
+                handler();
+        };
+        viewModel.PropertyChanged += wrapper;
+        return new DisposableAction(() => viewModel.PropertyChanged -= wrapper);
+    }
+
+    #region Generator Apply Methods
+
+    /// <summary>
+    /// Generator target for text binding.
+    /// </summary>
+    public static IDisposable ApplyBindText<TViewModel>(
+        this View view,
+        TViewModel viewModel,
+        string propertyName,
+        Func<TViewModel, object> getter,
+        Action<TViewModel, string>? setter = null
+    )
+        where TViewModel : INotifyPropertyChanged
+    {
+        if (setter != null)
+        {
+            return view.BindTwoWay(
+                viewModel,
+                getter,
+                val => setter(viewModel, val?.ToString() ?? string.Empty),
+                handler =>
+                {
+                    EventHandler internalHandler = (s, e) => handler();
+                    view.TextChanged += internalHandler;
+                    return new DisposableAction(() => view.TextChanged -= internalHandler);
+                },
+                () => view.Text?.ToString() ?? string.Empty,
+                val =>
+                {
+                    var newText = val?.ToString() ?? string.Empty;
+                    // CRITICAL FIX: Only set if the text is actually different.
+                    // This prevents the cursor-reset loop.
+                    if (view.Text != newText)
+                    {
+                        view.Text = newText;
+                    }
+                },
+                propertyName
+            );
+        }
+        else
+        {
+            return view.Bind(
+                viewModel,
+                getter,
+                val =>
+                {
+                    var newText = val?.ToString() ?? string.Empty;
+                    if (view.Text != newText)
+                    {
+                        view.Text = newText;
+                    }
+                },
+                propertyName
+            );
+        }
+    }
+
+    /// <summary>
+    /// Generator target for checked binding.
+    /// </summary>
+    public static IDisposable ApplyBindChecked<TViewModel>(
+        this CheckBox target,
+        TViewModel viewModel,
+        string propertyName,
+        Func<TViewModel, bool> getter,
+        Action<TViewModel, bool>? setter = null
+    )
+        where TViewModel : INotifyPropertyChanged
+    {
+        if (setter != null)
+        {
+            return target.BindTwoWay(
+                viewModel,
+                getter,
+                val => setter(viewModel, val),
+                handler =>
+                {
+                    EventHandler<ValueChangedEventArgs<CheckState>> internalHandler = (s, e) =>
+                        handler();
+                    target.ValueChanged += internalHandler;
+                    return new DisposableAction(() => target.ValueChanged -= internalHandler);
+                },
+                () => target.Value == CheckState.Checked,
+                val => target.Value = val ? CheckState.Checked : CheckState.UnChecked,
+                propertyName
+            );
+        }
+        else
+        {
+            return target.Bind(
+                viewModel,
+                getter,
+                val => target.Value = val ? CheckState.Checked : CheckState.UnChecked,
+                propertyName
+            );
+        }
+    }
+
+    /// <summary>
+    /// Generator target for visible binding.
+    /// </summary>
+    public static IDisposable ApplyBindVisible<TViewModel>(
+        this View target,
+        TViewModel viewModel,
+        string propertyName,
+        Func<TViewModel, bool> getter
+    )
+        where TViewModel : INotifyPropertyChanged
+    {
+        return target.Bind(viewModel, getter, val => target.Visible = val, propertyName);
+    }
+
+    /// <summary>
+    /// Generator target for enabled binding.
+    /// </summary>
+    public static IDisposable ApplyBindEnabled<TViewModel>(
+        this View target,
+        TViewModel viewModel,
+        string propertyName,
+        Func<TViewModel, bool> getter
+    )
+        where TViewModel : INotifyPropertyChanged
+    {
+        return target.Bind(viewModel, getter, val => target.Enabled = val, propertyName);
+    }
+
+    /// <summary>
+    /// Generator target for command binding.
+    /// </summary>
+    public static IDisposable ApplyBindCommand(this Button target, ICommand command)
+    {
+        return target.BindCommand(command);
+    }
+
+    #endregion
+
+    #region Private Helpers
+
+    /// <summary>
+    /// Robust, non-reflection compile-time expression string parsing.
+    /// Handles standard member lambdas, full paths, and local scope expressions cleanly [1].
+    /// </summary>
+    internal static string ExtractPropertyName(string? expression)
+    {
+        if (string.IsNullOrWhiteSpace(expression))
+        {
+            return "Text";
+        }
+
+        if (expression.Contains("=>"))
+        {
+            expression = expression.Split(["=>"], StringSplitOptions.None).Last().Trim();
+        }
+
+        string propertyName = expression.Split('.').Last().Trim('(', ')', ' ');
+
+        return propertyName;
+    }
+
+    #endregion
+}
+
+```
+
+// File: src\Stanza.TerminalGui\Binding\DisposableAction.cs
+
+```csharp
+namespace Stanza.TerminalGui;
+
+/// <summary>
+/// A simple disposable action that executes a delegate when disposed.
+/// Used for cleaning up event handlers and bindings.
+/// </summary>
+public class DisposableAction : IDisposable
+{
+    private readonly Action _action;
+    private bool _disposed;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DisposableAction"/> class.
+    /// </summary>
+    /// <param name="action">The logic to execute upon disposal. Must not be null.</param>
+    public DisposableAction(Action action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        _action = action;
+    }
+
+    /// <summary>
+    /// Executes the encapsulated cleanup action. Subsequent calls are ignored.
+    /// </summary>
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            _action();
+            _disposed = true;
+        }
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui\Binding\IStanzaView.cs
+
+```csharp
+using System.ComponentModel;
+
+namespace Stanza.TerminalGui;
+
+/// <summary>
+/// Defines the core contract for a Stanza-managed View.
+/// This interface is typically implemented automatically by the Source Generator
+/// for classes decorated with <see cref="StanzaViewAttribute{TViewModel}"/>.
+/// </summary>
+/// <typeparam name="TViewModel">The type of the ViewModel, which must implement <see cref="INotifyPropertyChanged"/>.</typeparam>
+public interface IStanzaView<TViewModel> : IDisposable
+    where TViewModel : INotifyPropertyChanged
+{
+    /// <summary>
+    /// Gets or sets the data context for the view.
+    /// Setting this property triggers binding re-synchronization and lifecycle management.
+    /// </summary>
+    TViewModel? ViewModel { get; set; }
+
+    /// <summary>
+    /// Gets the context managing the active bindings for the current <see cref="ViewModel"/>.
+    /// </summary>
+    BindingContext BindingContext { get; }
+}
+
+```
+
+// File: src\Stanza.TerminalGui\Logging\ILogger.cs
+
+```csharp
+namespace Stanza.TerminalGui;
+
+/// <summary>
+/// A lightweight logging interface for Stanza binding and lifecycle events.
+/// </summary>
+public interface ILogger
+{
+    /// <summary>
+    /// Log the received message.
+    /// </summary>
+    /// <param name="message"></param>
+    void Log(LogLevel level, string message, string category);
+
+    // Explicitly forces exceptions to be handled as Errors
+    void LogError(Exception exception, string message, string category);
+}
+
+```
+
+// File: src\Stanza.TerminalGui\Logging\StanzaConfig.cs
+
+```csharp
+namespace Stanza.TerminalGui;
+
+public enum LogLevel
+{
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+public static class StanzaConfig
+{
+    public static ILogger? Logger { get; set; }
+
+    public static void Trace(
+        string message,
+        LogLevel level = LogLevel.Debug,
+        [System.Runtime.CompilerServices.CallerFilePath] string? category = null
+    )
+    {
+        Logger?.Log(level, message, Path.GetFileNameWithoutExtension(category) ?? "Stanza");
+    }
+
+    public static void Error(
+        Exception exception,
+        string message,
+        [System.Runtime.CompilerServices.CallerFilePath] string? category = null
+    )
+    {
+        Logger?.LogError(
+            exception,
+            message,
+            Path.GetFileNameWithoutExtension(category) ?? "Stanza"
+        );
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui\BindingAttributes.cs
+
+```csharp
+namespace Stanza.TerminalGui;
+
+/// <summary>
+/// Base attribute for all Stanza MVVM bindings.
+/// This attribute provides the core logic for identifying which ViewModel property
+/// a UI element should synchronize with.
+/// </summary>
+[AttributeUsage(
+    AttributeTargets.Property | AttributeTargets.Field,
+    AllowMultiple = true,
+    Inherited = true
+)]
+public abstract class StanzaBindingAttribute : Attribute
+{
+    /// <summary>
+    /// Gets the name of the ViewModel property to bind to.
+    /// </summary>
+    public string ViewModelPropertyName { get; }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="StanzaBindingAttribute"/> class.
+    /// </summary>
+    /// <param name="viewModelPropertyName">The name of the property on the ViewModel. Use <c>nameof()</c> for refactoring safety.</param>
+    /// <exception cref="ArgumentException">Thrown if <paramref name="viewModelPropertyName"/> is null or whitespace.</exception>
+    protected StanzaBindingAttribute(string viewModelPropertyName)
+    {
+        if (string.IsNullOrWhiteSpace(viewModelPropertyName))
+            throw new ArgumentException(
+                "ViewModel property name cannot be null or empty.",
+                nameof(viewModelPropertyName)
+            );
+
+        ViewModelPropertyName = viewModelPropertyName;
+    }
+}
+
+/// <summary>
+/// Binds the <c>Text</c> property of a Terminal.Gui View to a ViewModel property.
+/// </summary>
+/// <remarks>
+/// By default, this uses <see cref="BindingMode.TwoWay"/> for input controls (like <c>TextField</c>)
+/// and <see cref="BindingMode.OneWay"/> for static controls (like <c>Label</c>).
+/// If the ViewModel property is read-only, the generator will automatically degrade this to <see cref="BindingMode.OneWay"/>.
+/// </remarks>
+public sealed class BindTextAttribute : StanzaBindingAttribute
+{
+    /// <summary>
+    /// Gets or sets the synchronization mode. Defaults to <see cref="BindingMode.TwoWay"/>.
+    /// </summary>
+    public BindingMode Mode { get; set; } = BindingMode.TwoWay;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="BindTextAttribute"/> class.
+    /// </summary>
+    /// <param name="viewModelPropertyName">The name of the string-compatible property on the ViewModel.</param>
+    public BindTextAttribute(string viewModelPropertyName)
+        : base(viewModelPropertyName) { }
+}
+
+/// <summary>
+/// Binds the <c>Checked</c> or <c>Value</c> state of a toggleable control (like <c>CheckBox</c>)
+/// to a boolean ViewModel property.
+/// </summary>
+/// <remarks>
+/// This binding requires the ViewModel property to be of type <see cref="bool"/>.
+/// Defaults to <see cref="BindingMode.TwoWay"/>.
+/// </remarks>
+public sealed class BindCheckedAttribute : StanzaBindingAttribute
+{
+    /// <summary>
+    /// Gets or sets the synchronization mode. Defaults to <see cref="BindingMode.TwoWay"/>.
+    /// </summary>
+    public BindingMode Mode { get; set; } = BindingMode.TwoWay;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="BindCheckedAttribute"/> class.
+    /// </summary>
+    /// <param name="viewModelPropertyName">The name of the boolean property on the ViewModel.</param>
+    public BindCheckedAttribute(string viewModelPropertyName)
+        : base(viewModelPropertyName) { }
+}
+
+/// <summary>
+/// Binds the <see cref="Terminal.Gui.ViewBase.View.Visible"/> property of a View to a boolean ViewModel property.
+/// </summary>
+/// <remarks>
+/// This is a <see cref="BindingMode.OneWay"/> binding. The UI state is driven by the ViewModel.
+/// </remarks>
+public sealed class BindVisibleAttribute : StanzaBindingAttribute
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="BindVisibleAttribute"/> class.
+    /// </summary>
+    /// <param name="viewModelPropertyName">The name of the boolean property on the ViewModel.</param>
+    public BindVisibleAttribute(string viewModelPropertyName)
+        : base(viewModelPropertyName) { }
+}
+
+/// <summary>
+/// Binds the <see cref="Terminal.Gui.ViewBase.View.Enabled"/> property of a View to a boolean ViewModel property.
+/// </summary>
+/// <remarks>
+/// This is a <see cref="BindingMode.OneWay"/> binding.
+/// For <c>Button</c> types, consider using <see cref="BindCommandAttribute"/> instead, as it handles
+/// the enabled state automatically via <c>CanExecute</c>.
+/// </remarks>
+public sealed class BindEnabledAttribute : StanzaBindingAttribute
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="BindEnabledAttribute"/> class.
+    /// </summary>
+    /// <param name="viewModelPropertyName">The name of the boolean property on the ViewModel.</param>
+    public BindEnabledAttribute(string viewModelPropertyName)
+        : base(viewModelPropertyName) { }
+}
+
+/// <summary>
+/// Binds an <see cref="System.Windows.Input.ICommand"/> from the ViewModel to a <c>Button</c> or interactive View.
+/// </summary>
+/// <remarks>
+/// This binding performs two actions:
+/// <list type="bullet">
+/// <item><description>Triggers <c>Execute</c> when the View's <c>Accepting</c> event fires.</description></item>
+/// <item><description>Synchronizes the View's <c>Enabled</c> state with the command's <c>CanExecute</c> status.</description></item>
+/// </list>
+/// </remarks>
+public sealed class BindCommandAttribute : StanzaBindingAttribute
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="BindCommandAttribute"/> class.
+    /// </summary>
+    /// <param name="viewModelPropertyName">The name of the <c>ICommand</c> property on the ViewModel.</param>
+    public BindCommandAttribute(string viewModelPropertyName)
+        : base(viewModelPropertyName) { }
+}
+
+public sealed class BindListAttribute : StanzaBindingAttribute
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="BindListAttribute"/> class.
+    /// </summary>
+    /// <param name="viewModelPropertyName">The name of the <c>ICommand</c> property on the ViewModel.</param>
+    public BindListAttribute(string viewModelPropertyName)
+        : base(viewModelPropertyName) { }
+}
+
+```
+
+// File: src\Stanza.TerminalGui\BindingMode.cs
+
+```csharp
+namespace Stanza.TerminalGui;
+
+public enum BindingMode
+{
+    OneWay,
+    TwoWay,
+}
+
+```
+
+// File: src\Stanza.TerminalGui\StanzaViewAttribute.cs
+
+```csharp
+namespace Stanza.TerminalGui;
+
+/// <summary>
+/// Marks a class for automatic generation with an explicit ViewModel type.
+/// </summary>
+/// <typeparam name="TViewModel">The type of the ViewModel to bind against.</typeparam>
+[AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
+public sealed class StanzaViewAttribute<TViewModel> : Attribute
+    where TViewModel : System.ComponentModel.INotifyPropertyChanged
+{
+    /// <summary>
+    /// Static title assigned to the view in the generated parameterless constructor.
+    /// Applies to views that inherit from <see cref="Terminal.Gui.Views.Window"/> or any
+    /// Terminal.Gui type that exposes a <c>Title</c> property.
+    /// </summary>
+    public string? Title { get; set; }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators\AnalyzerReleases.Shipped.md
+
+```markdown
+
+```
+
+// File: src\Stanza.TerminalGui.Generators\AnalyzerReleases.Unshipped.md
+
+```markdown
+### New Rules
+
+Rule ID | Category | Severity | Notes
+--------|----------|----------|-------
+STN010 | Usage    | Error    | Class must be partial.
+STN011 | Usage    | Error    | Must inherit from Terminal.Gui.View.
+STN012 | Usage    | Error    | Member name collision with generated plumbing.
+STN020 | Stanza.Binding | Warning    | Property name not found on ViewModel.
+STN021 | Stanza.Binding | Error    | Property found but not accessible.
+STN022 | Stanza.Binding | Error    | BindCommand target is not ICommand.
+STN004 | Stanza.Binding | Error    | Read-only property cannot have explicit TwoWay binding.
+STN005 | Stanza.Binding | Info     | Read-only property auto-degraded to OneWay.
+STN030 | Stanza.Binding | Error    | ViewModel type is incompatible with Binding type (e.g. string vs bool).
+STN031 | Stanza.Binding | Error    | Control type does not support this specific binding.
+STN032 | Stanza.Binding | Warning  | Multiple bindings targeting the same UI property.
+STN040 | Stanza.Binding | Error | StanzaDiagnostics
+STN041 | Stanza.Binding | Warning | StanzaDiagnostics
+
+```
+
+// File: src\Stanza.TerminalGui.Generators\InitializeComponentEmitter.cs
+
+```csharp
+using System.Text;
+
+namespace Stanza.TerminalGui.Generators;
+
+public static class Emitter
+{
+    public static string Emit(ViewIR view)
+    {
+        var sb = new StringBuilder();
+
+        // Header
+        sb.AppendLine("// <auto-generated/>");
+        sb.AppendLine("#nullable enable");
+        if (view.Namespace != "Global")
+        {
+            sb.AppendLine($"namespace {view.Namespace};");
+        }
+        sb.AppendLine();
+        sb.AppendLine("using Stanza.TerminalGui;");
+        sb.AppendLine();
+
+        // Class Declaration
+        sb.AppendLine($"partial class {view.ClassName} : IStanzaView<{view.ViewModelType}>");
+        sb.AppendLine("{");
+
+        // Plumbing (Static block)
+        sb.Append(
+            $$"""
+    private BindingContext _bindingContext = new();
+    public BindingContext BindingContext => _bindingContext;
+    private {{view.ViewModelType}}? _viewModel;
+
+    public {{view.ViewModelType}}? ViewModel
+    {
+        get => _viewModel;
+        set
+        {
+            if (object.ReferenceEquals(_viewModel, value)) return;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel changed on {{view.ClassName}}", LogLevel.Debug);
+            _viewModel = value;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel attached to {{view.ClassName}}", LogLevel.Info); 
+            ApplyBindings();
+        }
+    }
+
+    partial void OnApplyBindings(BindingContext context);
+
+"""
+        );
+
+        // Binding Method Start
+        sb.AppendLine("    private void ApplyBindings()");
+        sb.AppendLine("    {");
+        sb.AppendLine(
+            $"        StanzaConfig.Trace(\"[Lifecycle] Disposing old bindings for {view.ClassName}\", LogLevel.Debug);"
+        );
+        sb.AppendLine("        _bindingContext.Dispose();");
+        sb.AppendLine("        _bindingContext = new BindingContext();");
+        sb.AppendLine("        if (_viewModel == null)");
+        sb.AppendLine("        {");
+        sb.AppendLine(
+            $"            StanzaConfig.Trace(\"[Lifecycle] ViewModel is null for {view.ClassName}, skipping bindings.\", LogLevel.Debug);"
+        );
+        sb.AppendLine("            return;");
+        sb.AppendLine("        }");
+        sb.AppendLine(
+            $"        StanzaConfig.Trace(\"[Lifecycle] Applying {view.Bindings.Length} bindings for {view.ClassName}...\", LogLevel.Debug);"
+        );
+        sb.AppendLine();
+
+        // The Dynamic Loop (AppendLines are great here)
+        foreach (var binding in view.Bindings)
+        {
+            var target = binding.ControlName;
+            var vmProp = binding.ViewModelPropertyName;
+            var setter = binding.Mode == "TwoWay" ? $", (x, val) => x.{vmProp} = val" : "";
+
+            string method = binding.BindingType switch
+            {
+                "BindText" => "ApplyBindText",
+                "BindChecked" => "ApplyBindChecked",
+                "BindVisible" => "ApplyBindVisible",
+                "BindEnabled" => "ApplyBindEnabled",
+                "BindCommand" => "ApplyBindCommand",
+                _ => throw new NotImplementedException(),
+            };
+
+            if (method != null)
+            {
+                sb.AppendLine(
+                    $"        StanzaConfig.Trace(\"[Binding] Wiring {target} ({binding.BindingType}) -> ViewModel.{vmProp} (Mode: {binding.Mode})\", LogLevel.Debug);"
+                );
+
+                // Command is special (doesn't take the lambda/propertyName args)
+                if (binding.BindingType == "BindCommand")
+                    sb.AppendLine(
+                        $"        _bindingContext.AddBinding({target}.{method}(_viewModel.{vmProp}));"
+                    );
+                else
+                    sb.AppendLine(
+                        $"        _bindingContext.AddBinding({target}.{method}(_viewModel, \"{vmProp}\", x => x.{vmProp}{setter}));"
+                    );
+            }
+        }
+
+        // Method End & Dispose
+        sb.Append(
+            $$"""
+        StanzaConfig.Trace("[Lifecycle] Bindings applied successfully for {{view.ClassName}}.", LogLevel.Debug);
+        OnApplyBindings(_bindingContext);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        StanzaConfig.Trace($"[Lifecycle] Disposing {{view.ClassName}} (disposing: {disposing})", LogLevel.Debug);
+        if (disposing) _bindingContext.Dispose();
+        base.Dispose(disposing);
+    }
+}
+"""
+        );
+
+        return sb.ToString();
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators\IR.cs
+
+```csharp
+using System.Collections.Immutable;
+using Microsoft.CodeAnalysis;
+
+namespace Stanza.TerminalGui.Generators;
+
+public record BindingIR(
+    string ControlName,
+    string BindingType,
+    string ViewModelPropertyName,
+    string Mode // "OneWay" or "TwoWay"
+);
+
+public record ViewIR(
+    string Namespace,
+    string ClassName,
+    string ViewModelType,
+    ImmutableArray<BindingIR> Bindings
+);
+
+public record ViewParseResult(ViewIR? ViewIr, ImmutableArray<Diagnostic> Diagnostics);
+
+```
+
+// File: src\Stanza.TerminalGui.Generators\IsExternalInit.cs
+
+```csharp
+using System.ComponentModel;
+
+namespace System.Runtime.CompilerServices
+{
+    /// <summary>
+    /// Reserved to be used by the compiler for tracking metadata.
+    /// This class should not be used by developers in source code.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    internal static class IsExternalInit { }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators\ITypeSymbolExtensions.cs
+
+```csharp
+using Microsoft.CodeAnalysis;
+
+namespace Stanza.TerminalGui.Generators;
+
+public static class ITypeSymbolExtensions
+{
+    extension(ITypeSymbol typeSymbol)
+    {
+        public IPropertySymbol? FindPropertyInHierarchy(string? name)
+        {
+            var type = typeSymbol;
+            while (type != null)
+            {
+                var prop = type.GetMembers(name!).OfType<IPropertySymbol>().FirstOrDefault();
+                if (prop != null)
+                    return prop;
+                type = type.BaseType;
+            }
+            return null;
+        }
+
+        public bool IsSubtypeOf(string fullyQualifiedBaseName)
+        {
+            var current = typeSymbol.BaseType;
+            while (current != null)
+            {
+                if (current.ToDisplayString() == fullyQualifiedBaseName)
+                    return true;
+                current = current.BaseType;
+            }
+            return false;
+        }
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators\LoggingExtensionsEmitter.cs
+
+```csharp
+using System.Text;
+
+namespace Stanza.TerminalGui.Generators;
+
+internal static class LoggingExtensionsEmitter
+{
+    /// <summary>
+    /// Emits the MelLoggerAdapter and UseStanzaLogging extension methods when
+    /// Microsoft.Extensions.Logging types are present in the compilation.
+    /// </summary>
+    /// <param name="hasHost">Whether Microsoft.Extensions.Hosting.IHost is also available.</param>
+    public static string Emit(bool hasHost)
+    {
+        var sb = new StringBuilder();
+
+        sb.AppendLine("// <auto-generated/>");
+        sb.AppendLine("#nullable enable");
+        sb.AppendLine();
+        sb.AppendLine("namespace Stanza.TerminalGui;");
+        sb.AppendLine();
+
+        // Internal MEL adapter — stays private to the consumer's compilation
+        sb.Append(
+            """
+internal sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
+{
+    private readonly global::Microsoft.Extensions.Logging.ILoggerFactory _factory;
+
+    internal MelLoggerAdapter(global::Microsoft.Extensions.Logging.ILoggerFactory factory)
+    {
+        _factory = factory;
+    }
+
+    public void Log(global::Stanza.TerminalGui.LogLevel level, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        var melLevel = level switch
+        {
+            global::Stanza.TerminalGui.LogLevel.Debug => global::Microsoft.Extensions.Logging.LogLevel.Debug,
+            global::Stanza.TerminalGui.LogLevel.Info => global::Microsoft.Extensions.Logging.LogLevel.Information,
+            global::Stanza.TerminalGui.LogLevel.Warn => global::Microsoft.Extensions.Logging.LogLevel.Warning,
+            global::Stanza.TerminalGui.LogLevel.Error => global::Microsoft.Extensions.Logging.LogLevel.Error,
+            _ => global::Microsoft.Extensions.Logging.LogLevel.Information
+        };
+        
+        global::Microsoft.Extensions.Logging.LoggerExtensions.Log(logger, melLevel, message);
+    }
+
+    public void LogError(global::System.Exception exception, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        global::Microsoft.Extensions.Logging.LoggerExtensions.LogError(logger, exception, message);
+    }
+}
+
+"""
+        );
+
+        sb.AppendLine("internal static class StanzaLoggingExtensions");
+        sb.AppendLine("{");
+
+        sb.Append(
+            """
+                /// <summary>
+                /// Wires Stanza's internal logging into the application's MEL pipeline.
+                /// Call this after the service provider is built so that <see cref="Microsoft.Extensions.Logging.ILoggerFactory"/> is available.
+                /// </summary>
+                public static System.IServiceProvider UseStanzaLogging(this System.IServiceProvider provider)
+                {
+                    StanzaConfig.Logger = new MelLoggerAdapter(
+                        (Microsoft.Extensions.Logging.ILoggerFactory)provider.GetService(typeof(Microsoft.Extensions.Logging.ILoggerFactory))!
+                    );
+                    return provider;
+                }
+
+            """
+        );
+
+        if (hasHost)
+        {
+            sb.Append(
+                """
+                    /// <summary>
+                    /// Wires Stanza's internal logging into the application's MEL pipeline.
+                    /// </summary>
+                    /// <example>
+                    /// <code>
+                    /// var host = builder.Build();
+                    /// host.UseStanzaLogging();
+                    /// await host.RunAsync();
+                    /// </code>
+                    /// </example>
+                    public static Microsoft.Extensions.Hosting.IHost UseStanzaLogging(this Microsoft.Extensions.Hosting.IHost host)
+                    {
+                        host.Services.UseStanzaLogging();
+                        return host;
+                    }
+
+                """
+            );
+        }
+
+        sb.AppendLine("}");
+
+        return sb.ToString();
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators\StanzaBindingGenerator.cs
+
+```csharp
+using System.Collections.Immutable;
+using System.Linq;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+
+namespace Stanza.TerminalGui.Generators;
+
+[Generator(LanguageNames.CSharp)]
+public class StanzaBindingGenerator : IIncrementalGenerator
+{
+    public void Initialize(IncrementalGeneratorInitializationContext context)
+    {
+        var viewProvider = context.SyntaxProvider.ForAttributeWithMetadataName(
+            "Stanza.TerminalGui.StanzaViewAttribute`1",
+            predicate: (node, _) => node is ClassDeclarationSyntax,
+            transform: GetViewIR
+        );
+
+        context.RegisterSourceOutput(
+            viewProvider,
+            (spc, result) =>
+            {
+                foreach (var diag in result.Diagnostics)
+                {
+                    spc.ReportDiagnostic(diag);
+                }
+
+                if (result.ViewIr != null)
+                {
+                    var source = Emitter.Emit(result.ViewIr);
+                    spc.AddSource($"{result.ViewIr.ClassName}.g.cs", source);
+                }
+            }
+        );
+
+        var loggingProvider = context.CompilationProvider.Select(
+            (compilation, _) =>
+            {
+                // Don't emit into the core library itself — only into consuming projects.
+                if (compilation.AssemblyName == "Stanza.TerminalGui")
+                    return (hasLogging: false, hasHost: false);
+
+                var hasLogging =
+                    compilation.GetTypeByMetadataName("Microsoft.Extensions.Logging.ILoggerFactory")
+                    != null;
+                var hasHost =
+                    compilation.GetTypeByMetadataName("Microsoft.Extensions.Hosting.IHost") != null;
+                return (hasLogging, hasHost);
+            }
+        );
+
+        context.RegisterSourceOutput(
+            loggingProvider,
+            (spc, flags) =>
+            {
+                if (!flags.hasLogging)
+                    return;
+                spc.AddSource(
+                    "StanzaLoggingExtensions.g.cs",
+                    LoggingExtensionsEmitter.Emit(flags.hasHost)
+                );
+            }
+        );
+    }
+
+    private static ViewParseResult GetViewIR(
+        GeneratorAttributeSyntaxContext context,
+        CancellationToken token
+    )
+    {
+        var classSymbol = context.TargetSymbol as INamedTypeSymbol;
+        var classDeclaration = context.TargetNode as ClassDeclarationSyntax;
+
+        if (classSymbol == null || classDeclaration == null)
+            return new ViewParseResult(null, ImmutableArray<Diagnostic>.Empty);
+
+        var diagnostics = ImmutableArray.CreateBuilder<Diagnostic>();
+
+        // 1. STN010: Structural Check - Partial
+        if (!classDeclaration.Modifiers.Any(m => m.IsKind(SyntaxKind.PartialKeyword)))
+        {
+            diagnostics.Add(
+                Diagnostic.Create(
+                    StanzaDiagnostics.ClassMustBePartial,
+                    classDeclaration.Identifier.GetLocation(),
+                    classSymbol.Name
+                )
+            );
+            // Fatal structural error - stop here
+            return new ViewParseResult(null, diagnostics.ToImmutable());
+        }
+
+        // 2. STN011: Structural Check - Inherits from View
+        // We check both the specific namespace and the short name to be resilient in test environments
+        if (
+            !classSymbol.IsSubtypeOf("Terminal.Gui.ViewBase.View")
+            && classSymbol.BaseType?.Name != "View"
+        )
+        {
+            diagnostics.Add(
+                Diagnostic.Create(
+                    StanzaDiagnostics.MustInheritFromView,
+                    classDeclaration.Identifier.GetLocation(),
+                    classSymbol.Name
+                )
+            );
+            return new ViewParseResult(null, diagnostics.ToImmutable());
+        }
+
+        // 3. STN012: Member Collisions
+        var reservedNames = new[]
+        {
+            "ViewModel",
+            "BindingContext",
+            "_bindingContext",
+            "ApplyBindings",
+        };
+        foreach (var reserved in reservedNames)
+        {
+            var existing = classSymbol.GetMembers(reserved).FirstOrDefault();
+            // Only flag if it was declared in the same syntax tree (the user's source)
+            if (
+                existing != null
+                && existing.DeclaringSyntaxReferences.Any(r =>
+                    r.SyntaxTree == classDeclaration.SyntaxTree
+                )
+            )
+            {
+                diagnostics.Add(
+                    Diagnostic.Create(
+                        StanzaDiagnostics.MemberCollision,
+                        existing.Locations.FirstOrDefault()
+                            ?? classDeclaration.Identifier.GetLocation(),
+                        classSymbol.Name,
+                        reserved
+                    )
+                );
+            }
+        }
+
+        var attribute = context.Attributes.First(a =>
+            a.AttributeClass?.Name.Contains("StanzaViewAttribute") == true
+        );
+        var vmTypeSymbol =
+            attribute.AttributeClass?.TypeArguments.FirstOrDefault() as INamedTypeSymbol;
+
+        if (vmTypeSymbol == null)
+            return new ViewParseResult(null, diagnostics.ToImmutable());
+
+        // 4. STN040: ViewModel must implement INotifyPropertyChanged
+        bool implementsInpc = vmTypeSymbol.AllInterfaces.Any(i =>
+            i.ToDisplayString() == "System.ComponentModel.INotifyPropertyChanged"
+        );
+        if (!implementsInpc)
+        {
+            diagnostics.Add(
+                Diagnostic.Create(
+                    StanzaDiagnostics.ViewModelMustImplementINPC,
+                    attribute.ApplicationSyntaxReference?.GetSyntax(token).GetLocation()
+                        ?? classDeclaration.Identifier.GetLocation(),
+                    vmTypeSymbol.Name
+                )
+            );
+        }
+
+        // 5. STN041: Unmanaged Event Subscriptions
+        var methodSmells = classDeclaration
+            .DescendantNodes()
+            .OfType<MethodDeclarationSyntax>()
+            .Where(m =>
+                m.Identifier.Text == "OnApplyBindings"
+                || m.Modifiers.Any(mod => mod.IsKind(SyntaxKind.PublicKeyword))
+            );
+        var ctorSmells = classDeclaration.DescendantNodes().OfType<ConstructorDeclarationSyntax>();
+
+        foreach (var method in methodSmells.Cast<MemberDeclarationSyntax>().Concat(ctorSmells))
+        {
+            var addAssignments = method
+                .DescendantNodes()
+                .OfType<AssignmentExpressionSyntax>()
+                .Where(a => a.IsKind(SyntaxKind.AddAssignmentExpression));
+
+            foreach (var assignment in addAssignments)
+            {
+                // We're looking for += that isn't wrapped in AddBinding or followed by .AddTo
+                // This is a naive heuristic but good for a "smell" diagnostic
+                var parent = assignment.Parent;
+                bool isManaged = false;
+
+                // Check up the tree for AddBinding or AddTo
+                while (parent != null && parent != method)
+                {
+                    var parentText = parent.ToString();
+                    if (parentText.Contains("AddBinding") || parentText.Contains("AddTo"))
+                    {
+                        isManaged = true;
+                        break;
+                    }
+                    parent = parent.Parent;
+                }
+
+                if (!isManaged)
+                {
+                    diagnostics.Add(
+                        Diagnostic.Create(
+                            StanzaDiagnostics.UnmanagedEventSubscription,
+                            assignment.GetLocation(),
+                            method is MethodDeclarationSyntax mds
+                                ? mds.Identifier.Text
+                                : "constructor"
+                        )
+                    );
+                }
+            }
+        }
+
+        var vmType = vmTypeSymbol.ToDisplayString();
+        var bindings = ImmutableArray.CreateBuilder<BindingIR>();
+        var members = classSymbol
+            .GetMembers()
+            .Where(m => m is IPropertySymbol || m is IFieldSymbol);
+
+        foreach (var member in members)
+        {
+            token.ThrowIfCancellationRequested();
+
+            var memberBindings = member
+                .GetAttributes()
+                .Where(a =>
+                    a.AttributeClass?.Name.StartsWith("Bind") == true
+                    && a.AttributeClass.Name.EndsWith("Attribute")
+                )
+                .ToList();
+
+            if (memberBindings.Count > 1)
+            {
+                diagnostics.Add(
+                    Diagnostic.Create(
+                        StanzaDiagnostics.DuplicateBinding,
+                        member.Locations.FirstOrDefault(),
+                        member.Name
+                    )
+                );
+            }
+
+            foreach (var attr in memberBindings)
+            {
+                var attrName = attr.AttributeClass!.Name;
+                var bindingType = attrName.Substring(0, attrName.Length - "Attribute".Length);
+                var vmPropName = attr.ConstructorArguments.FirstOrDefault().Value?.ToString();
+                var attrLocation = attr.ApplicationSyntaxReference?.GetSyntax(token).GetLocation();
+
+                if (string.IsNullOrEmpty(vmPropName))
+                    continue;
+
+                // STN020: Resolution - Search the full hierarchy for the property
+                var vmProperty = vmTypeSymbol.FindPropertyInHierarchy(vmPropName);
+                if (vmProperty == null)
+                {
+                    // Heuristic: Is this a CommunityToolkit Command that hasn't been generated yet?
+                    bool isLikelyGeneratedCommand =
+                        bindingType == "BindCommand"
+                        && (vmPropName?.EndsWith("Command") == true)
+                        && vmTypeSymbol
+                            .GetMembers(
+                                vmPropName.Substring(0, vmPropName.Length - "Command".Length)
+                            )
+                            .Any(m => m is IMethodSymbol);
+
+                    // If it's not a known generated pattern, we should warn the user
+                    if (!isLikelyGeneratedCommand)
+                    {
+                        diagnostics.Add(
+                            Diagnostic.Create(
+                                StanzaDiagnostics.PropertyNotFound,
+                                attrLocation,
+                                vmPropName,
+                                vmType
+                            )
+                        );
+                    }
+
+                    // Even if it's likely generated, we must proceed with caution.
+                    // We'll add it to the IR because the emitted code will use the string name anyway.
+                    // If the property TRULY doesn't exist, the final C# compilation of the .g.cs will fail.
+                    bindings.Add(new BindingIR(member.Name, bindingType, vmPropName!, "OneWay"));
+                    continue;
+                }
+
+                // STN031: Invalid control target
+                ITypeSymbol memberType = member is IPropertySymbol ps
+                    ? ps.Type
+                    : ((IFieldSymbol)member).Type;
+                if (
+                    bindingType == "BindChecked"
+                    && !memberType.IsSubtypeOf("Terminal.Gui.Views.CheckBox")
+                    && memberType.Name != "CheckBox"
+                )
+                {
+                    diagnostics.Add(
+                        Diagnostic.Create(
+                            StanzaDiagnostics.InvalidControlTarget,
+                            attrLocation,
+                            bindingType,
+                            member.Name
+                        )
+                    );
+                    continue;
+                }
+                if (
+                    bindingType == "BindCommand"
+                    && !memberType.IsSubtypeOf("Terminal.Gui.Views.Button")
+                    && memberType.Name != "Button"
+                )
+                {
+                    diagnostics.Add(
+                        Diagnostic.Create(
+                            StanzaDiagnostics.InvalidControlTarget,
+                            attrLocation,
+                            bindingType,
+                            member.Name
+                        )
+                    );
+                    continue;
+                }
+
+                // STN021: Resolution - Accessibility
+                if (vmProperty.DeclaredAccessibility < Accessibility.Internal)
+                {
+                    diagnostics.Add(
+                        Diagnostic.Create(
+                            StanzaDiagnostics.PropertyInaccessible,
+                            attrLocation,
+                            vmPropName,
+                            vmType
+                        )
+                    );
+                    continue;
+                }
+
+                // STN022: Command Type Safety
+                if (bindingType == "BindCommand")
+                {
+                    bool implementsCommand = vmProperty.Type.AllInterfaces.Any(i =>
+                        i.ToDisplayString() == "System.Windows.Input.ICommand"
+                        || i.Name == "ICommand"
+                    );
+                    if (!implementsCommand)
+                    {
+                        diagnostics.Add(
+                            Diagnostic.Create(
+                                StanzaDiagnostics.NotAnICommand,
+                                attrLocation,
+                                vmPropName
+                            )
+                        );
+                        continue;
+                    }
+                }
+
+                // STN030: Value Type Safety
+                var boolRequired = new[] { "BindChecked", "BindVisible", "BindEnabled" };
+                if (
+                    boolRequired.Contains(bindingType)
+                    && vmProperty.Type.SpecialType != SpecialType.System_Boolean
+                )
+                {
+                    diagnostics.Add(
+                        Diagnostic.Create(
+                            StanzaDiagnostics.TypeMismatch,
+                            attrLocation,
+                            bindingType,
+                            "bool",
+                            vmPropName,
+                            vmProperty.Type.ToDisplayString()
+                        )
+                    );
+                    continue;
+                }
+
+                // Read-Only Logic
+                bool isReadOnly = vmProperty.IsReadOnly;
+                string mode =
+                    (bindingType == "BindText" || bindingType == "BindChecked")
+                        ? "TwoWay"
+                        : "OneWay";
+                bool isExplicitMode = false;
+
+                var modeArg = attr.NamedArguments.FirstOrDefault(kvp => kvp.Key == "Mode");
+                if (modeArg.Key != null && modeArg.Value.Value is int modeValue)
+                {
+                    mode = modeValue == 0 ? "OneWay" : "TwoWay";
+                    isExplicitMode = true;
+                }
+
+                if (mode == "TwoWay" && isReadOnly)
+                {
+                    if (isExplicitMode)
+                    {
+                        diagnostics.Add(
+                            Diagnostic.Create(
+                                StanzaDiagnostics.InvalidTwoWayBinding,
+                                attrLocation,
+                                vmPropName
+                            )
+                        );
+                        continue;
+                    }
+                    else
+                    {
+                        mode = "OneWay";
+                        diagnostics.Add(
+                            Diagnostic.Create(
+                                StanzaDiagnostics.AutoDegradedBinding,
+                                attrLocation,
+                                vmPropName
+                            )
+                        );
+                    }
+                }
+
+                bindings.Add(new BindingIR(member.Name, bindingType, vmPropName!, mode));
+            }
+        }
+
+        // Resolve Namespace safely for Emitter
+        string ns = classSymbol.ContainingNamespace.IsGlobalNamespace
+            ? "Global"
+            : classSymbol.ContainingNamespace.ToDisplayString();
+
+        return new ViewParseResult(
+            new ViewIR(ns, classSymbol.Name, vmType, bindings.ToImmutable()),
+            diagnostics.ToImmutable()
+        );
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators\StanzaDiagnostics.cs
+
+```csharp
+using Microsoft.CodeAnalysis;
+
+namespace Stanza.TerminalGui.Generators;
+
+public static class StanzaDiagnostics
+{
+    private const string Category = "Stanza.Binding";
+
+    // --- Structural Rules (STN01x) ---
+
+    public static readonly DiagnosticDescriptor ClassMustBePartial = new(
+        id: "STN010",
+        title: "Class must be partial",
+        messageFormat: "The class '{0}' must be declared with the 'partial' keyword to support Stanza code generation",
+        category: "Usage",
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    public static readonly DiagnosticDescriptor MustInheritFromView = new(
+        id: "STN011",
+        title: "Invalid base type",
+        messageFormat: "The class '{0}' must inherit from 'Terminal.Gui.View' to use StanzaView attributes",
+        category: "Usage",
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    public static readonly DiagnosticDescriptor MemberCollision = new(
+        id: "STN012",
+        title: "Member collision",
+        messageFormat: "The class '{0}' already defines a member named '{1}'. Stanza generator needs this name for plumbing.",
+        category: "Usage",
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    // --- Resolution Rules (STN02x) ---
+
+    public static readonly DiagnosticDescriptor PropertyNotFound = new(
+        id: "STN020",
+        title: "ViewModel property not found",
+        messageFormat: "The property '{0}' was not found on ViewModel type '{1}'",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true
+    );
+
+    public static readonly DiagnosticDescriptor PropertyInaccessible = new(
+        id: "STN021",
+        title: "ViewModel property inaccessible",
+        messageFormat: "The property '{0}' on '{1}' must be accessible (public or internal) to be used in a binding",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    public static readonly DiagnosticDescriptor NotAnICommand = new(
+        id: "STN022",
+        title: "Invalid command type",
+        messageFormat: "The property '{0}' does not implement System.Windows.Input.ICommand",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    // --- Type Safety & Logic (STN03x) ---
+
+    public static readonly DiagnosticDescriptor InvalidTwoWayBinding = new(
+        id: "STN004", // Retaining your original ID
+        title: "Invalid Two-Way Binding",
+        messageFormat: "ViewModel property '{0}' is read-only. Explicit TwoWay binding is not allowed.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    public static readonly DiagnosticDescriptor AutoDegradedBinding = new(
+        id: "STN005", // Retaining your original ID
+        title: "Auto-degraded Binding",
+        messageFormat: "ViewModel property '{0}' is read-only. Auto-degrading to OneWay binding.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Info,
+        isEnabledByDefault: true
+    );
+
+    public static readonly DiagnosticDescriptor TypeMismatch = new(
+        id: "STN030",
+        title: "Binding type mismatch",
+        messageFormat: "Binding '{0}' expects type '{1}', but property '{2}' is of type '{3}'",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    public static readonly DiagnosticDescriptor InvalidControlTarget = new(
+        id: "STN031",
+        title: "Invalid control target",
+        messageFormat: "The attribute '{0}' cannot be applied to '{1}' because it does not support the required events/properties",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    public static readonly DiagnosticDescriptor DuplicateBinding = new(
+        id: "STN032",
+        title: "Duplicate binding",
+        messageFormat: "The property '{0}' already has a binding assigned. Multiple bindings to the same UI property are not supported.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true
+    );
+
+    // --- Smells & Safety (STN04x) ---
+
+    public static readonly DiagnosticDescriptor ViewModelMustImplementINPC = new(
+        id: "STN040",
+        title: "ViewModel must implement INotifyPropertyChanged",
+        messageFormat: "The ViewModel type '{0}' must implement INotifyPropertyChanged for bindings to work correctly",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    public static readonly DiagnosticDescriptor UnmanagedEventSubscription = new(
+        id: "STN041",
+        title: "Unmanaged event subscription",
+        messageFormat: "Manual event subscription detected in '{0}'. This will leak when the ViewModel is swapped or the View is disposed. Route subscriptions through 'BindingContext' or use '.AddTo(context)'.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true
+    );
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\DiagnosticTests.cs
+
+```csharp
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+
+namespace Stanza.TerminalGui.Generators.Tests;
+
+public class DiagnosticTests
+{
+    [Test]
+    public async Task STN005_Error_OnExplicitTwoWayReadOnly()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+                public string ReadOnlyProp => "Hello";
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                [BindText(nameof(MyVm.ReadOnlyProp), Mode = BindingMode.TwoWay)]
+                public Label MyLabel { get; set; } = new();
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN005");
+    }
+
+    [Test]
+    public async Task STN005_Info_AutoDegradesDefaultTwoWayToOneWay()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class ReadOnlyVm : System.ComponentModel.INotifyPropertyChanged {
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+                public string ReadOnlyProp => "Constant";
+            }
+
+            [StanzaView<ReadOnlyVm>]
+            public partial class MyView : View {
+                [BindText("ReadOnlyProp")] // Default is TwoWay, but prop is read-only
+                public TextField MyInput { get; set; } = new();
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+        var generated = TestHelper.GetGeneratedSource(source, "MyView.g.cs");
+
+        // 1. Verify the diagnostic info message
+        await Assert
+            .That(diags)
+            .Contains(d => d.Id == "STN005" && d.Severity == DiagnosticSeverity.Info);
+
+        // 2. Verify generated code does NOT have a setter lambda
+        await Assert.That(generated).Contains("x => x.ReadOnlyProp)");
+        await Assert.That(generated).DoesNotContain("val) => x.ReadOnlyProp = val");
+    }
+
+    [Test]
+    public async Task STN010_Error_WhenClassIsNotPartial()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<MyVm>]
+            public class MyView : View { } // Missing 'partial'
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags.Any(d => d.Id == "STN010")).IsTrue();
+    }
+
+    [Test]
+    public async Task STN011_Error_WhenNotInheritingFromView()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView { } // Doesn't inherit from View
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags.Any(d => d.Id == "STN011")).IsTrue();
+    }
+
+    [Test]
+    public async Task STN020_Error_WhenPropertyDoesNotExistOnVm()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                [BindText("NonExistentProperty")]
+                public Label MyLabel { get; set; } = new();
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN020");
+    }
+
+    [Test]
+    public async Task STN030_Error_WhenBindCheckedUsedOnString()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+                public string NotABool { get; set; } = "";
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                [BindChecked(nameof(MyVm.NotABool))]
+                public CheckBox MyCheck { get; set; } = new();
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN030");
+    }
+
+    [Test]
+    public async Task STN012_Error_OnMemberCollision()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                // Collision with generated plumbing
+                public string ViewModel { get; set; } = ""; 
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN012");
+    }
+
+    [Test]
+    public async Task STN040_Error_WhenViewModelDoesNotImplementINPC()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class NotInpcVm { 
+                public string Name { get; set; } = "";
+            }
+
+            [StanzaView<NotInpcVm>]
+            public partial class MyView : View { }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN040");
+    }
+
+    [Test]
+    public async Task STN041_Warning_OnUnmanagedEventSubscriptionInCtor()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                public Button MyButton { get; set; } = new();
+                public MyView() {
+                    MyButton.Accepting += (s, e) => { }; // Smell!
+                }
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN041");
+    }
+
+    [Test]
+    public async Task STN041_Warning_OnUnmanagedSubscriptionInApplyBindings()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                public Button MyButton { get; set; } = new();
+                partial void OnApplyBindings(BindingContext context) {
+                    MyButton.Accepting += (s, e) => { }; // Smell!
+                }
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN041");
+    }
+
+    [Test]
+    public async Task STN041_NoError_WhenSubscriptionIsManaged()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                public Button MyButton { get; set; } = new();
+                partial void OnApplyBindings(BindingContext context) {
+                    // This is fine
+                    new System.Action(() => { }).AddTo(context);
+                }
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags.Any(d => d.Id == "STN041")).IsFalse();
+    }
+
+    [Test]
+    public async Task STN031_Error_WhenBindCheckedOnNonCheckBox()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+                public bool IsActive { get; set; }
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                [BindChecked(nameof(MyVm.IsActive))]
+                public Button MyButton { get; set; } = new(); // Invalid target for BindChecked
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN031");
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.cs
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Stanza.TerminalGui.Generators;
+using Terminal.Gui;
+using VerifyTests;
+using VerifyTUnit;
+
+namespace Stanza.TerminalGui.Generators.Tests;
+
+public class GeneratorSnapshotTests
+{
+    [Test]
+    public Task GeneratesCorrectly_BindText_TwoWay()
+    {
+        var source = """
+using Stanza.TerminalGui;
+using Terminal.Gui.Views;
+using Terminal.Gui.ViewBase;
+using CommunityToolkit.Mvvm.ComponentModel; // For ObservableObject
+
+namespace TestNamespace;
+
+public partial class MyViewModel : ObservableObject
+{
+    public string Name { get; set; }
+}
+
+[StanzaView<MyViewModel>]
+public partial class MyView : View
+{
+    [BindText(nameof(MyViewModel.Name))]
+    public Label MyLabel { get; set; } = new() { Text = "Hello" };
+}
+""";
+
+        return TestHelper.VerifyGenerator(source);
+    }
+
+    [Test]
+    public async Task ReadOnlyBindText_DegradesToOneWay_NoSetterLambdaEmitted()
+    {
+        var source = """
+using Stanza.TerminalGui;
+using Terminal.Gui.ViewBase;
+using Terminal.Gui.Views;
+
+namespace TestNamespace;
+
+public class ReadOnlyVm : CommunityToolkit.Mvvm.ComponentModel.ObservableObject
+{
+    public string Name => "ReadOnly";
+}
+
+[StanzaView<ReadOnlyVm>]
+public partial class ReadOnlyBindingView : View
+{
+    [BindText(nameof(ReadOnlyVm.Name))]
+    public Label NameLabel { get; set; } = new();
+}
+""";
+
+        var generated = TestHelper.GetGeneratedSource(source, "ReadOnlyBindingView.g.cs");
+        await Assert
+            .That(
+                generated.Contains(
+                    "ApplyBindText(_viewModel, \"Name\", x => x.Name)",
+                    StringComparison.Ordinal
+                )
+            )
+            .IsTrue();
+        await Assert
+            .That(generated.Contains("(x, val) => x.Name = val", StringComparison.Ordinal))
+            .IsFalse();
+    }
+
+    [Test]
+    public Task GeneratesCorrectly_BindCommand()
+    {
+        var source = """
+using Stanza.TerminalGui;
+using Terminal.Gui.Views;
+using Terminal.Gui.ViewBase;
+using System.Windows.Input;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+
+namespace TestNamespace;
+
+public partial class MyViewModel : ObservableObject
+{
+    [RelayCommand]
+    private void Save() { } // CommunityToolkit will generate SaveCommand
+}
+
+[StanzaView<MyViewModel>]
+public partial class MyView : View
+{
+    [BindCommand(nameof(MyViewModel.SaveCommand))]
+    public Button SaveButton { get; set; } = new();
+}
+""";
+        return TestHelper.VerifyGenerator(source, "CS0117", "CS1061");
+    }
+
+    [Test]
+    public Task GeneratesCorrectly_BindChecked_TwoWay()
+    {
+        var source = """
+using Stanza.TerminalGui;
+using Terminal.Gui.Views;
+using Terminal.Gui.ViewBase;
+using CommunityToolkit.Mvvm.ComponentModel;
+
+namespace TestNamespace;
+
+public partial class MyViewModel : ObservableObject
+{
+    public bool IsChecked { get; set; }
+}
+
+[StanzaView<MyViewModel>]
+public partial class MyView : View
+{
+    [BindChecked(nameof(MyViewModel.IsChecked))]
+    public CheckBox MyCheckBox { get; set; } = new();
+}
+""";
+        return TestHelper.VerifyGenerator(source);
+    }
+
+    [Test]
+    public Task GeneratesCorrectly_BindVisible_OneWay()
+    {
+        var source = """
+using Stanza.TerminalGui;
+using Terminal.Gui.Views;
+using Terminal.Gui.ViewBase;
+using CommunityToolkit.Mvvm.ComponentModel;
+
+namespace TestNamespace;
+
+public partial class MyViewModel : ObservableObject
+{
+    public bool ShowElement { get; set; }
+}
+
+[StanzaView<MyViewModel>]
+public partial class MyView : View
+{
+    [BindVisible(nameof(MyViewModel.ShowElement))]
+    public Label MyLabel { get; set; } = new();
+}
+""";
+        return TestHelper.VerifyGenerator(source);
+    }
+
+    [Test]
+    public Task GeneratesCorrectly_BindEnabled_OneWay()
+    {
+        var source = """
+using Stanza.TerminalGui;
+using Terminal.Gui.Views;
+using Terminal.Gui.ViewBase;
+using CommunityToolkit.Mvvm.ComponentModel;
+
+namespace TestNamespace;
+
+public partial class MyViewModel : ObservableObject
+{
+    public bool CanEdit { get; set; }
+}
+
+[StanzaView<MyViewModel>]
+public partial class MyView : View
+{
+    [BindEnabled(nameof(MyViewModel.CanEdit))]
+    public TextField MyTextField { get; set; } = new();
+}
+""";
+        return TestHelper.VerifyGenerator(source);
+    }
+
+    [Test]
+    public Task GeneratesCorrectly_WithNoBindings()
+    {
+        var source = """
+using Stanza.TerminalGui;
+using Terminal.Gui.Views;
+using Terminal.Gui.ViewBase;
+using CommunityToolkit.Mvvm.ComponentModel;
+
+namespace TestNamespace;
+
+public partial class MyViewModel : ObservableObject
+{
+    public string Name { get; set; }
+}
+
+[StanzaView<MyViewModel>]
+public partial class MyView : View
+{
+    // No bindings here
+    public Label MyLabel { get; set; } = new();
+}
+""";
+        return TestHelper.VerifyGenerator(source);
+    }
+
+    [Test]
+    public Task GeneratesCorrectly_GlobalNamespace()
+    {
+        var source = """
+using Stanza.TerminalGui;
+using Terminal.Gui.Views;
+using Terminal.Gui.ViewBase;
+using CommunityToolkit.Mvvm.ComponentModel;
+
+public partial class GlobalViewModel : ObservableObject
+{
+    public string Status { get; set; }
+}
+
+[StanzaView<GlobalViewModel>]
+public partial class GlobalView : View
+{
+    [BindText(nameof(GlobalViewModel.Status))]
+    public Label StatusLabel { get; set; } = new();
+}
+""";
+        return TestHelper.VerifyGenerator(source);
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_BindChecked_TwoWay#MyView.g.verified.cs
+
+```csharp
+//HintName: MyView.g.cs
+// <auto-generated/>
+#nullable enable
+namespace TestNamespace;
+
+using Stanza.TerminalGui;
+
+partial class MyView : IStanzaView<TestNamespace.MyViewModel>
+{
+    private BindingContext _bindingContext = new();
+    public BindingContext BindingContext => _bindingContext;
+    private TestNamespace.MyViewModel? _viewModel;
+
+    public TestNamespace.MyViewModel? ViewModel
+    {
+        get => _viewModel;
+        set
+        {
+            if (object.ReferenceEquals(_viewModel, value)) return;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel changed on MyView", LogLevel.Debug);
+            _viewModel = value;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel attached to MyView", LogLevel.Info); 
+            ApplyBindings();
+        }
+    }
+
+    partial void OnApplyBindings(BindingContext context);
+    private void ApplyBindings()
+    {
+        StanzaConfig.Trace("[Lifecycle] Disposing old bindings for MyView", LogLevel.Debug);
+        _bindingContext.Dispose();
+        _bindingContext = new BindingContext();
+        if (_viewModel == null)
+        {
+            StanzaConfig.Trace("[Lifecycle] ViewModel is null for MyView, skipping bindings.", LogLevel.Debug);
+            return;
+        }
+        StanzaConfig.Trace("[Lifecycle] Applying 1 bindings for MyView...", LogLevel.Debug);
+
+        StanzaConfig.Trace("[Binding] Wiring MyCheckBox (BindChecked) -> ViewModel.IsChecked (Mode: TwoWay)", LogLevel.Debug);
+        _bindingContext.AddBinding(MyCheckBox.ApplyBindChecked(_viewModel, "IsChecked", x => x.IsChecked, (x, val) => x.IsChecked = val));
+        StanzaConfig.Trace("[Lifecycle] Bindings applied successfully for MyView.", LogLevel.Debug);
+        OnApplyBindings(_bindingContext);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        StanzaConfig.Trace($"[Lifecycle] Disposing MyView (disposing: {disposing})", LogLevel.Debug);
+        if (disposing) _bindingContext.Dispose();
+        base.Dispose(disposing);
+    }
+}
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_BindChecked_TwoWay#StanzaLoggingExtensions.g.verified.cs
+
+```csharp
+//HintName: StanzaLoggingExtensions.g.cs
+// <auto-generated/>
+#nullable enable
+
+namespace Stanza.TerminalGui;
+
+internal sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
+{
+    private readonly global::Microsoft.Extensions.Logging.ILoggerFactory _factory;
+
+    internal MelLoggerAdapter(global::Microsoft.Extensions.Logging.ILoggerFactory factory)
+    {
+        _factory = factory;
+    }
+
+    public void Log(global::Stanza.TerminalGui.LogLevel level, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        var melLevel = level switch
+        {
+            global::Stanza.TerminalGui.LogLevel.Debug => global::Microsoft.Extensions.Logging.LogLevel.Debug,
+            global::Stanza.TerminalGui.LogLevel.Info => global::Microsoft.Extensions.Logging.LogLevel.Information,
+            global::Stanza.TerminalGui.LogLevel.Warn => global::Microsoft.Extensions.Logging.LogLevel.Warning,
+            global::Stanza.TerminalGui.LogLevel.Error => global::Microsoft.Extensions.Logging.LogLevel.Error,
+            _ => global::Microsoft.Extensions.Logging.LogLevel.Information
+        };
+        
+        global::Microsoft.Extensions.Logging.LoggerExtensions.Log(logger, melLevel, message);
+    }
+
+    public void LogError(global::System.Exception exception, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        global::Microsoft.Extensions.Logging.LoggerExtensions.LogError(logger, exception, message);
+    }
+}
+public static class StanzaLoggingExtensions
+{
+    /// <summary>
+    /// Wires Stanza's internal logging into the application's MEL pipeline.
+    /// Call this after the service provider is built so that <see cref="Microsoft.Extensions.Logging.ILoggerFactory"/> is available.
+    /// </summary>
+    public static System.IServiceProvider UseStanzaLogging(this System.IServiceProvider provider)
+    {
+        StanzaConfig.Logger = new MelLoggerAdapter(
+            (Microsoft.Extensions.Logging.ILoggerFactory)provider.GetService(typeof(Microsoft.Extensions.Logging.ILoggerFactory))!
+        );
+        return provider;
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_BindCommand#MyView.g.verified.cs
+
+```csharp
+//HintName: MyView.g.cs
+// <auto-generated/>
+#nullable enable
+namespace TestNamespace;
+
+using Stanza.TerminalGui;
+
+partial class MyView : IStanzaView<TestNamespace.MyViewModel>
+{
+    private BindingContext _bindingContext = new();
+    public BindingContext BindingContext => _bindingContext;
+    private TestNamespace.MyViewModel? _viewModel;
+
+    public TestNamespace.MyViewModel? ViewModel
+    {
+        get => _viewModel;
+        set
+        {
+            if (object.ReferenceEquals(_viewModel, value)) return;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel changed on MyView", LogLevel.Debug);
+            _viewModel = value;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel attached to MyView", LogLevel.Info); 
+            ApplyBindings();
+        }
+    }
+
+    partial void OnApplyBindings(BindingContext context);
+    private void ApplyBindings()
+    {
+        StanzaConfig.Trace("[Lifecycle] Disposing old bindings for MyView", LogLevel.Debug);
+        _bindingContext.Dispose();
+        _bindingContext = new BindingContext();
+        if (_viewModel == null)
+        {
+            StanzaConfig.Trace("[Lifecycle] ViewModel is null for MyView, skipping bindings.", LogLevel.Debug);
+            return;
+        }
+        StanzaConfig.Trace("[Lifecycle] Applying 1 bindings for MyView...", LogLevel.Debug);
+
+        StanzaConfig.Trace("[Binding] Wiring SaveButton (BindCommand) -> ViewModel.SaveCommand (Mode: OneWay)", LogLevel.Debug);
+        _bindingContext.AddBinding(SaveButton.ApplyBindCommand(_viewModel.SaveCommand));
+        StanzaConfig.Trace("[Lifecycle] Bindings applied successfully for MyView.", LogLevel.Debug);
+        OnApplyBindings(_bindingContext);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        StanzaConfig.Trace($"[Lifecycle] Disposing MyView (disposing: {disposing})", LogLevel.Debug);
+        if (disposing) _bindingContext.Dispose();
+        base.Dispose(disposing);
+    }
+}
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_BindCommand#StanzaLoggingExtensions.g.verified.cs
+
+```csharp
+//HintName: StanzaLoggingExtensions.g.cs
+// <auto-generated/>
+#nullable enable
+
+namespace Stanza.TerminalGui;
+
+internal sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
+{
+    private readonly global::Microsoft.Extensions.Logging.ILoggerFactory _factory;
+
+    internal MelLoggerAdapter(global::Microsoft.Extensions.Logging.ILoggerFactory factory)
+    {
+        _factory = factory;
+    }
+
+    public void Log(global::Stanza.TerminalGui.LogLevel level, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        var melLevel = level switch
+        {
+            global::Stanza.TerminalGui.LogLevel.Debug => global::Microsoft.Extensions.Logging.LogLevel.Debug,
+            global::Stanza.TerminalGui.LogLevel.Info => global::Microsoft.Extensions.Logging.LogLevel.Information,
+            global::Stanza.TerminalGui.LogLevel.Warn => global::Microsoft.Extensions.Logging.LogLevel.Warning,
+            global::Stanza.TerminalGui.LogLevel.Error => global::Microsoft.Extensions.Logging.LogLevel.Error,
+            _ => global::Microsoft.Extensions.Logging.LogLevel.Information
+        };
+        
+        global::Microsoft.Extensions.Logging.LoggerExtensions.Log(logger, melLevel, message);
+    }
+
+    public void LogError(global::System.Exception exception, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        global::Microsoft.Extensions.Logging.LoggerExtensions.LogError(logger, exception, message);
+    }
+}
+public static class StanzaLoggingExtensions
+{
+    /// <summary>
+    /// Wires Stanza's internal logging into the application's MEL pipeline.
+    /// Call this after the service provider is built so that <see cref="Microsoft.Extensions.Logging.ILoggerFactory"/> is available.
+    /// </summary>
+    public static System.IServiceProvider UseStanzaLogging(this System.IServiceProvider provider)
+    {
+        StanzaConfig.Logger = new MelLoggerAdapter(
+            (Microsoft.Extensions.Logging.ILoggerFactory)provider.GetService(typeof(Microsoft.Extensions.Logging.ILoggerFactory))!
+        );
+        return provider;
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_BindEnabled_OneWay#MyView.g.verified.cs
+
+```csharp
+//HintName: MyView.g.cs
+// <auto-generated/>
+#nullable enable
+namespace TestNamespace;
+
+using Stanza.TerminalGui;
+
+partial class MyView : IStanzaView<TestNamespace.MyViewModel>
+{
+    private BindingContext _bindingContext = new();
+    public BindingContext BindingContext => _bindingContext;
+    private TestNamespace.MyViewModel? _viewModel;
+
+    public TestNamespace.MyViewModel? ViewModel
+    {
+        get => _viewModel;
+        set
+        {
+            if (object.ReferenceEquals(_viewModel, value)) return;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel changed on MyView", LogLevel.Debug);
+            _viewModel = value;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel attached to MyView", LogLevel.Info); 
+            ApplyBindings();
+        }
+    }
+
+    partial void OnApplyBindings(BindingContext context);
+    private void ApplyBindings()
+    {
+        StanzaConfig.Trace("[Lifecycle] Disposing old bindings for MyView", LogLevel.Debug);
+        _bindingContext.Dispose();
+        _bindingContext = new BindingContext();
+        if (_viewModel == null)
+        {
+            StanzaConfig.Trace("[Lifecycle] ViewModel is null for MyView, skipping bindings.", LogLevel.Debug);
+            return;
+        }
+        StanzaConfig.Trace("[Lifecycle] Applying 1 bindings for MyView...", LogLevel.Debug);
+
+        StanzaConfig.Trace("[Binding] Wiring MyTextField (BindEnabled) -> ViewModel.CanEdit (Mode: OneWay)", LogLevel.Debug);
+        _bindingContext.AddBinding(MyTextField.ApplyBindEnabled(_viewModel, "CanEdit", x => x.CanEdit));
+        StanzaConfig.Trace("[Lifecycle] Bindings applied successfully for MyView.", LogLevel.Debug);
+        OnApplyBindings(_bindingContext);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        StanzaConfig.Trace($"[Lifecycle] Disposing MyView (disposing: {disposing})", LogLevel.Debug);
+        if (disposing) _bindingContext.Dispose();
+        base.Dispose(disposing);
+    }
+}
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_BindEnabled_OneWay#StanzaLoggingExtensions.g.verified.cs
+
+```csharp
+//HintName: StanzaLoggingExtensions.g.cs
+// <auto-generated/>
+#nullable enable
+
+namespace Stanza.TerminalGui;
+
+internal sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
+{
+    private readonly global::Microsoft.Extensions.Logging.ILoggerFactory _factory;
+
+    internal MelLoggerAdapter(global::Microsoft.Extensions.Logging.ILoggerFactory factory)
+    {
+        _factory = factory;
+    }
+
+    public void Log(global::Stanza.TerminalGui.LogLevel level, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        var melLevel = level switch
+        {
+            global::Stanza.TerminalGui.LogLevel.Debug => global::Microsoft.Extensions.Logging.LogLevel.Debug,
+            global::Stanza.TerminalGui.LogLevel.Info => global::Microsoft.Extensions.Logging.LogLevel.Information,
+            global::Stanza.TerminalGui.LogLevel.Warn => global::Microsoft.Extensions.Logging.LogLevel.Warning,
+            global::Stanza.TerminalGui.LogLevel.Error => global::Microsoft.Extensions.Logging.LogLevel.Error,
+            _ => global::Microsoft.Extensions.Logging.LogLevel.Information
+        };
+        
+        global::Microsoft.Extensions.Logging.LoggerExtensions.Log(logger, melLevel, message);
+    }
+
+    public void LogError(global::System.Exception exception, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        global::Microsoft.Extensions.Logging.LoggerExtensions.LogError(logger, exception, message);
+    }
+}
+public static class StanzaLoggingExtensions
+{
+    /// <summary>
+    /// Wires Stanza's internal logging into the application's MEL pipeline.
+    /// Call this after the service provider is built so that <see cref="Microsoft.Extensions.Logging.ILoggerFactory"/> is available.
+    /// </summary>
+    public static System.IServiceProvider UseStanzaLogging(this System.IServiceProvider provider)
+    {
+        StanzaConfig.Logger = new MelLoggerAdapter(
+            (Microsoft.Extensions.Logging.ILoggerFactory)provider.GetService(typeof(Microsoft.Extensions.Logging.ILoggerFactory))!
+        );
+        return provider;
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_BindText_TwoWay#MyView.g.verified.cs
+
+```csharp
+//HintName: MyView.g.cs
+// <auto-generated/>
+#nullable enable
+namespace TestNamespace;
+
+using Stanza.TerminalGui;
+
+partial class MyView : IStanzaView<TestNamespace.MyViewModel>
+{
+    private BindingContext _bindingContext = new();
+    public BindingContext BindingContext => _bindingContext;
+    private TestNamespace.MyViewModel? _viewModel;
+
+    public TestNamespace.MyViewModel? ViewModel
+    {
+        get => _viewModel;
+        set
+        {
+            if (object.ReferenceEquals(_viewModel, value)) return;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel changed on MyView", LogLevel.Debug);
+            _viewModel = value;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel attached to MyView", LogLevel.Info); 
+            ApplyBindings();
+        }
+    }
+
+    partial void OnApplyBindings(BindingContext context);
+    private void ApplyBindings()
+    {
+        StanzaConfig.Trace("[Lifecycle] Disposing old bindings for MyView", LogLevel.Debug);
+        _bindingContext.Dispose();
+        _bindingContext = new BindingContext();
+        if (_viewModel == null)
+        {
+            StanzaConfig.Trace("[Lifecycle] ViewModel is null for MyView, skipping bindings.", LogLevel.Debug);
+            return;
+        }
+        StanzaConfig.Trace("[Lifecycle] Applying 1 bindings for MyView...", LogLevel.Debug);
+
+        StanzaConfig.Trace("[Binding] Wiring MyLabel (BindText) -> ViewModel.Name (Mode: TwoWay)", LogLevel.Debug);
+        _bindingContext.AddBinding(MyLabel.ApplyBindText(_viewModel, "Name", x => x.Name, (x, val) => x.Name = val));
+        StanzaConfig.Trace("[Lifecycle] Bindings applied successfully for MyView.", LogLevel.Debug);
+        OnApplyBindings(_bindingContext);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        StanzaConfig.Trace($"[Lifecycle] Disposing MyView (disposing: {disposing})", LogLevel.Debug);
+        if (disposing) _bindingContext.Dispose();
+        base.Dispose(disposing);
+    }
+}
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_BindText_TwoWay#StanzaLoggingExtensions.g.verified.cs
+
+```csharp
+//HintName: StanzaLoggingExtensions.g.cs
+// <auto-generated/>
+#nullable enable
+
+namespace Stanza.TerminalGui;
+
+internal sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
+{
+    private readonly global::Microsoft.Extensions.Logging.ILoggerFactory _factory;
+
+    internal MelLoggerAdapter(global::Microsoft.Extensions.Logging.ILoggerFactory factory)
+    {
+        _factory = factory;
+    }
+
+    public void Log(global::Stanza.TerminalGui.LogLevel level, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        var melLevel = level switch
+        {
+            global::Stanza.TerminalGui.LogLevel.Debug => global::Microsoft.Extensions.Logging.LogLevel.Debug,
+            global::Stanza.TerminalGui.LogLevel.Info => global::Microsoft.Extensions.Logging.LogLevel.Information,
+            global::Stanza.TerminalGui.LogLevel.Warn => global::Microsoft.Extensions.Logging.LogLevel.Warning,
+            global::Stanza.TerminalGui.LogLevel.Error => global::Microsoft.Extensions.Logging.LogLevel.Error,
+            _ => global::Microsoft.Extensions.Logging.LogLevel.Information
+        };
+        
+        global::Microsoft.Extensions.Logging.LoggerExtensions.Log(logger, melLevel, message);
+    }
+
+    public void LogError(global::System.Exception exception, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        global::Microsoft.Extensions.Logging.LoggerExtensions.LogError(logger, exception, message);
+    }
+}
+public static class StanzaLoggingExtensions
+{
+    /// <summary>
+    /// Wires Stanza's internal logging into the application's MEL pipeline.
+    /// Call this after the service provider is built so that <see cref="Microsoft.Extensions.Logging.ILoggerFactory"/> is available.
+    /// </summary>
+    public static System.IServiceProvider UseStanzaLogging(this System.IServiceProvider provider)
+    {
+        StanzaConfig.Logger = new MelLoggerAdapter(
+            (Microsoft.Extensions.Logging.ILoggerFactory)provider.GetService(typeof(Microsoft.Extensions.Logging.ILoggerFactory))!
+        );
+        return provider;
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_BindVisible_OneWay#MyView.g.verified.cs
+
+```csharp
+//HintName: MyView.g.cs
+// <auto-generated/>
+#nullable enable
+namespace TestNamespace;
+
+using Stanza.TerminalGui;
+
+partial class MyView : IStanzaView<TestNamespace.MyViewModel>
+{
+    private BindingContext _bindingContext = new();
+    public BindingContext BindingContext => _bindingContext;
+    private TestNamespace.MyViewModel? _viewModel;
+
+    public TestNamespace.MyViewModel? ViewModel
+    {
+        get => _viewModel;
+        set
+        {
+            if (object.ReferenceEquals(_viewModel, value)) return;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel changed on MyView", LogLevel.Debug);
+            _viewModel = value;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel attached to MyView", LogLevel.Info); 
+            ApplyBindings();
+        }
+    }
+
+    partial void OnApplyBindings(BindingContext context);
+    private void ApplyBindings()
+    {
+        StanzaConfig.Trace("[Lifecycle] Disposing old bindings for MyView", LogLevel.Debug);
+        _bindingContext.Dispose();
+        _bindingContext = new BindingContext();
+        if (_viewModel == null)
+        {
+            StanzaConfig.Trace("[Lifecycle] ViewModel is null for MyView, skipping bindings.", LogLevel.Debug);
+            return;
+        }
+        StanzaConfig.Trace("[Lifecycle] Applying 1 bindings for MyView...", LogLevel.Debug);
+
+        StanzaConfig.Trace("[Binding] Wiring MyLabel (BindVisible) -> ViewModel.ShowElement (Mode: OneWay)", LogLevel.Debug);
+        _bindingContext.AddBinding(MyLabel.ApplyBindVisible(_viewModel, "ShowElement", x => x.ShowElement));
+        StanzaConfig.Trace("[Lifecycle] Bindings applied successfully for MyView.", LogLevel.Debug);
+        OnApplyBindings(_bindingContext);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        StanzaConfig.Trace($"[Lifecycle] Disposing MyView (disposing: {disposing})", LogLevel.Debug);
+        if (disposing) _bindingContext.Dispose();
+        base.Dispose(disposing);
+    }
+}
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_BindVisible_OneWay#StanzaLoggingExtensions.g.verified.cs
+
+```csharp
+//HintName: StanzaLoggingExtensions.g.cs
+// <auto-generated/>
+#nullable enable
+
+namespace Stanza.TerminalGui;
+
+internal sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
+{
+    private readonly global::Microsoft.Extensions.Logging.ILoggerFactory _factory;
+
+    internal MelLoggerAdapter(global::Microsoft.Extensions.Logging.ILoggerFactory factory)
+    {
+        _factory = factory;
+    }
+
+    public void Log(global::Stanza.TerminalGui.LogLevel level, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        var melLevel = level switch
+        {
+            global::Stanza.TerminalGui.LogLevel.Debug => global::Microsoft.Extensions.Logging.LogLevel.Debug,
+            global::Stanza.TerminalGui.LogLevel.Info => global::Microsoft.Extensions.Logging.LogLevel.Information,
+            global::Stanza.TerminalGui.LogLevel.Warn => global::Microsoft.Extensions.Logging.LogLevel.Warning,
+            global::Stanza.TerminalGui.LogLevel.Error => global::Microsoft.Extensions.Logging.LogLevel.Error,
+            _ => global::Microsoft.Extensions.Logging.LogLevel.Information
+        };
+        
+        global::Microsoft.Extensions.Logging.LoggerExtensions.Log(logger, melLevel, message);
+    }
+
+    public void LogError(global::System.Exception exception, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        global::Microsoft.Extensions.Logging.LoggerExtensions.LogError(logger, exception, message);
+    }
+}
+public static class StanzaLoggingExtensions
+{
+    /// <summary>
+    /// Wires Stanza's internal logging into the application's MEL pipeline.
+    /// Call this after the service provider is built so that <see cref="Microsoft.Extensions.Logging.ILoggerFactory"/> is available.
+    /// </summary>
+    public static System.IServiceProvider UseStanzaLogging(this System.IServiceProvider provider)
+    {
+        StanzaConfig.Logger = new MelLoggerAdapter(
+            (Microsoft.Extensions.Logging.ILoggerFactory)provider.GetService(typeof(Microsoft.Extensions.Logging.ILoggerFactory))!
+        );
+        return provider;
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_GlobalNamespace#GlobalView.g.verified.cs
+
+```csharp
+//HintName: GlobalView.g.cs
+// <auto-generated/>
+#nullable enable
+
+using Stanza.TerminalGui;
+
+partial class GlobalView : IStanzaView<GlobalViewModel>
+{
+    private BindingContext _bindingContext = new();
+    public BindingContext BindingContext => _bindingContext;
+    private GlobalViewModel? _viewModel;
+
+    public GlobalViewModel? ViewModel
+    {
+        get => _viewModel;
+        set
+        {
+            if (object.ReferenceEquals(_viewModel, value)) return;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel changed on GlobalView", LogLevel.Debug);
+            _viewModel = value;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel attached to GlobalView", LogLevel.Info); 
+            ApplyBindings();
+        }
+    }
+
+    partial void OnApplyBindings(BindingContext context);
+    private void ApplyBindings()
+    {
+        StanzaConfig.Trace("[Lifecycle] Disposing old bindings for GlobalView", LogLevel.Debug);
+        _bindingContext.Dispose();
+        _bindingContext = new BindingContext();
+        if (_viewModel == null)
+        {
+            StanzaConfig.Trace("[Lifecycle] ViewModel is null for GlobalView, skipping bindings.", LogLevel.Debug);
+            return;
+        }
+        StanzaConfig.Trace("[Lifecycle] Applying 1 bindings for GlobalView...", LogLevel.Debug);
+
+        StanzaConfig.Trace("[Binding] Wiring StatusLabel (BindText) -> ViewModel.Status (Mode: TwoWay)", LogLevel.Debug);
+        _bindingContext.AddBinding(StatusLabel.ApplyBindText(_viewModel, "Status", x => x.Status, (x, val) => x.Status = val));
+        StanzaConfig.Trace("[Lifecycle] Bindings applied successfully for GlobalView.", LogLevel.Debug);
+        OnApplyBindings(_bindingContext);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        StanzaConfig.Trace($"[Lifecycle] Disposing GlobalView (disposing: {disposing})", LogLevel.Debug);
+        if (disposing) _bindingContext.Dispose();
+        base.Dispose(disposing);
+    }
+}
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_GlobalNamespace#StanzaLoggingExtensions.g.verified.cs
+
+```csharp
+//HintName: StanzaLoggingExtensions.g.cs
+// <auto-generated/>
+#nullable enable
+
+namespace Stanza.TerminalGui;
+
+internal sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
+{
+    private readonly global::Microsoft.Extensions.Logging.ILoggerFactory _factory;
+
+    internal MelLoggerAdapter(global::Microsoft.Extensions.Logging.ILoggerFactory factory)
+    {
+        _factory = factory;
+    }
+
+    public void Log(global::Stanza.TerminalGui.LogLevel level, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        var melLevel = level switch
+        {
+            global::Stanza.TerminalGui.LogLevel.Debug => global::Microsoft.Extensions.Logging.LogLevel.Debug,
+            global::Stanza.TerminalGui.LogLevel.Info => global::Microsoft.Extensions.Logging.LogLevel.Information,
+            global::Stanza.TerminalGui.LogLevel.Warn => global::Microsoft.Extensions.Logging.LogLevel.Warning,
+            global::Stanza.TerminalGui.LogLevel.Error => global::Microsoft.Extensions.Logging.LogLevel.Error,
+            _ => global::Microsoft.Extensions.Logging.LogLevel.Information
+        };
+        
+        global::Microsoft.Extensions.Logging.LoggerExtensions.Log(logger, melLevel, message);
+    }
+
+    public void LogError(global::System.Exception exception, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        global::Microsoft.Extensions.Logging.LoggerExtensions.LogError(logger, exception, message);
+    }
+}
+public static class StanzaLoggingExtensions
+{
+    /// <summary>
+    /// Wires Stanza's internal logging into the application's MEL pipeline.
+    /// Call this after the service provider is built so that <see cref="Microsoft.Extensions.Logging.ILoggerFactory"/> is available.
+    /// </summary>
+    public static System.IServiceProvider UseStanzaLogging(this System.IServiceProvider provider)
+    {
+        StanzaConfig.Logger = new MelLoggerAdapter(
+            (Microsoft.Extensions.Logging.ILoggerFactory)provider.GetService(typeof(Microsoft.Extensions.Logging.ILoggerFactory))!
+        );
+        return provider;
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_WithNoBindings#MyView.g.verified.cs
+
+```csharp
+//HintName: MyView.g.cs
+// <auto-generated/>
+#nullable enable
+namespace TestNamespace;
+
+using Stanza.TerminalGui;
+
+partial class MyView : IStanzaView<TestNamespace.MyViewModel>
+{
+    private BindingContext _bindingContext = new();
+    public BindingContext BindingContext => _bindingContext;
+    private TestNamespace.MyViewModel? _viewModel;
+
+    public TestNamespace.MyViewModel? ViewModel
+    {
+        get => _viewModel;
+        set
+        {
+            if (object.ReferenceEquals(_viewModel, value)) return;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel changed on MyView", LogLevel.Debug);
+            _viewModel = value;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel attached to MyView", LogLevel.Info); 
+            ApplyBindings();
+        }
+    }
+
+    partial void OnApplyBindings(BindingContext context);
+    private void ApplyBindings()
+    {
+        StanzaConfig.Trace("[Lifecycle] Disposing old bindings for MyView", LogLevel.Debug);
+        _bindingContext.Dispose();
+        _bindingContext = new BindingContext();
+        if (_viewModel == null)
+        {
+            StanzaConfig.Trace("[Lifecycle] ViewModel is null for MyView, skipping bindings.", LogLevel.Debug);
+            return;
+        }
+        StanzaConfig.Trace("[Lifecycle] Applying 0 bindings for MyView...", LogLevel.Debug);
+
+        StanzaConfig.Trace("[Lifecycle] Bindings applied successfully for MyView.", LogLevel.Debug);
+        OnApplyBindings(_bindingContext);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        StanzaConfig.Trace($"[Lifecycle] Disposing MyView (disposing: {disposing})", LogLevel.Debug);
+        if (disposing) _bindingContext.Dispose();
+        base.Dispose(disposing);
+    }
+}
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly_WithNoBindings#StanzaLoggingExtensions.g.verified.cs
+
+```csharp
+//HintName: StanzaLoggingExtensions.g.cs
+// <auto-generated/>
+#nullable enable
+
+namespace Stanza.TerminalGui;
+
+internal sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
+{
+    private readonly global::Microsoft.Extensions.Logging.ILoggerFactory _factory;
+
+    internal MelLoggerAdapter(global::Microsoft.Extensions.Logging.ILoggerFactory factory)
+    {
+        _factory = factory;
+    }
+
+    public void Log(global::Stanza.TerminalGui.LogLevel level, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        var melLevel = level switch
+        {
+            global::Stanza.TerminalGui.LogLevel.Debug => global::Microsoft.Extensions.Logging.LogLevel.Debug,
+            global::Stanza.TerminalGui.LogLevel.Info => global::Microsoft.Extensions.Logging.LogLevel.Information,
+            global::Stanza.TerminalGui.LogLevel.Warn => global::Microsoft.Extensions.Logging.LogLevel.Warning,
+            global::Stanza.TerminalGui.LogLevel.Error => global::Microsoft.Extensions.Logging.LogLevel.Error,
+            _ => global::Microsoft.Extensions.Logging.LogLevel.Information
+        };
+        
+        global::Microsoft.Extensions.Logging.LoggerExtensions.Log(logger, melLevel, message);
+    }
+
+    public void LogError(global::System.Exception exception, string message, string category)
+    {
+        var logger = _factory.CreateLogger(category);
+        global::Microsoft.Extensions.Logging.LoggerExtensions.LogError(logger, exception, message);
+    }
+}
+public static class StanzaLoggingExtensions
+{
+    /// <summary>
+    /// Wires Stanza's internal logging into the application's MEL pipeline.
+    /// Call this after the service provider is built so that <see cref="Microsoft.Extensions.Logging.ILoggerFactory"/> is available.
+    /// </summary>
+    public static System.IServiceProvider UseStanzaLogging(this System.IServiceProvider provider)
+    {
+        StanzaConfig.Logger = new MelLoggerAdapter(
+            (Microsoft.Extensions.Logging.ILoggerFactory)provider.GetService(typeof(Microsoft.Extensions.Logging.ILoggerFactory))!
+        );
+        return provider;
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesCorrectly#MyView.g.verified.cs
+
+```csharp
+//HintName: MyView.g.cs
+// <auto-generated/>
+#nullable enable
+namespace TestNamespace;
+
+using Stanza.TerminalGui;
+
+partial class MyView : IStanzaView<TestNamespace.MyViewModel>
+{
+    private BindingContext _bindingContext = new();
+    public BindingContext BindingContext => _bindingContext;
+    private TestNamespace.MyViewModel? _viewModel;
+
+    public TestNamespace.MyViewModel? ViewModel
+    {
+        get => _viewModel;
+        set
+        {
+            if (object.ReferenceEquals(_viewModel, value)) return;
+            _viewModel = value;
+            ApplyBindings();
+        }
+    }
+
+    partial void OnApplyBindings(BindingContext context);
+    private void ApplyBindings()
+    {
+        _bindingContext.Dispose();
+        _bindingContext = new BindingContext();
+        if (_viewModel == null) return;
+
+        _bindingContext.AddBinding(MyLabel.ApplyBindText(_viewModel, "Name", x => x.Name, (x, val) => x.Name = val));
+        OnApplyBindings(_bindingContext);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _bindingContext.Dispose();
+        base.Dispose(disposing);
+    }
+}
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\GeneratorSnapshotTests.GeneratesWithGenericAttribute#MyView.g.verified.cs
+
+```csharp
+//HintName: MyView.g.cs
+// <auto-generated/>
+#nullable enable
+namespace TestNamespace;
+
+using Stanza.TerminalGui;
+
+partial class MyView : IStanzaView<TestNamespace.MyViewModel>
+{
+    private BindingContext _bindingContext = new();
+    public BindingContext BindingContext => _bindingContext;
+    private TestNamespace.MyViewModel? _viewModel;
+
+    public TestNamespace.MyViewModel? ViewModel
+    {
+        get => _viewModel;
+        set
+        {
+            if (object.ReferenceEquals(_viewModel, value)) return;
+            _viewModel = value;
+            ApplyBindings();
+        }
+    }
+
+    partial void OnApplyBindings(BindingContext context);
+    private void ApplyBindings()
+    {
+        _bindingContext.Dispose();
+        _bindingContext = new BindingContext();
+        if (_viewModel == null) return;
+
+        _bindingContext.AddBinding(MyLabel.ApplyBindText(_viewModel, "Name", x => x.Name, (x, val) => x.Name = val));
+        OnApplyBindings(_bindingContext);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _bindingContext.Dispose();
+        base.Dispose(disposing);
+    }
+}
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\ModuleInitializer.cs
+
+```csharp
+using System.Runtime.CompilerServices;
+using VerifyTests;
+
+namespace Stanza.TerminalGui.Generators.Tests;
+
+public static class ModuleInitializer
+{
+    [ModuleInitializer]
+    public static void Init()
+    {
+        VerifySourceGenerators.Initialize();
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\ResolutionTests.cs
+
+```csharp
+using Microsoft.CodeAnalysis;
+
+namespace Stanza.TerminalGui.Generators.Tests;
+
+public class ResolutionTests
+{
+    // src\Stanza.TerminalGui.Generators.Tests\ResolutionTests.cs
+
+    [Test]
+    public async Task STN020_Warning_OnRealTypo()
+    {
+        var source = """
+using Stanza.TerminalGui;
+using Terminal.Gui.Views;
+
+public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+    public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+    public string Name { get; set; }
+}
+
+[StanzaView<MyVm>]
+public partial class MyView : View {
+    [BindText("Nmae")] // Typo: Should trigger warning
+    public Label MyLabel { get; set; } = new();
+}
+""";
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+        await Assert
+            .That(diags)
+            .Contains(d => d.Id == "STN020" && d.Severity == DiagnosticSeverity.Warning);
+    }
+
+    [Test]
+    public async Task RelayCommand_Heuristic_SuppressesSTN020()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+                
+                // This simulates the method that triggers CommunityToolkit.Mvvm
+                // The 'SaveCommand' property doesn't exist yet, but the method does.
+                public void Save() { } 
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                [BindCommand("SaveCommand")] 
+                public Button SaveBtn { get; set; } = new();
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        // Should NOT contain STN020 because the heuristic detects 'Save()' method
+        await Assert.That(diags.Any(d => d.Id == "STN020")).IsFalse();
+    }
+
+    [Test]
+    public async Task STN021_Error_WhenViewModelPropertyIsPrivate()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+                private string Secret { get; set; } // Private!
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                [BindText("Secret")]
+                public Label MyLabel { get; set; } = new();
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+        await Assert.That(diags).Contains(d => d.Id == "STN021");
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\TestHelper.cs
+
+```csharp
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+
+namespace Stanza.TerminalGui.Generators.Tests;
+
+public static class TestHelper
+{
+    public static Task VerifyGenerator(string source, params string[] ignoredDiagnostics)
+    {
+        var (driver, _, runResult, compileDiagnostics) = RunGenerator(source);
+
+        if (runResult.Diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
+        {
+            throw new Exception("Generator errors: " + string.Join("\n", runResult.Diagnostics));
+        }
+
+        var errors = compileDiagnostics
+            .Where(d => d.Severity == DiagnosticSeverity.Error)
+            .Where(d => !ignoredDiagnostics.Contains(d.Id)) // Filter out CS0117, CS1061, etc.
+            .ToList();
+
+        if (errors.Count != 0)
+        {
+            throw new Exception(
+                "Compilation errors:\n"
+                    + string.Join(
+                        "\n",
+                        compileDiagnostics.Where(d => d.Severity == DiagnosticSeverity.Error)
+                    )
+            );
+        }
+
+        return Verify(driver);
+    }
+
+    public static IReadOnlyList<Diagnostic> VerifyDiagnostics(string source)
+    {
+        var (_, _, runResult, _) = RunGenerator(source);
+        return runResult.Diagnostics;
+    }
+
+    public static string GetGeneratedSource(string source, string hintName)
+    {
+        var (_, _, runResult, _) = RunGenerator(source);
+        var generated = runResult
+            .Results.SelectMany(r => r.GeneratedSources)
+            .FirstOrDefault(gs => gs.HintName == hintName);
+
+        if (generated.HintName is null)
+        {
+            throw new InvalidOperationException($"Generated source '{hintName}' was not found.");
+        }
+
+        return generated.SourceText.ToString();
+    }
+
+    private static (
+        GeneratorDriver Driver,
+        CSharpCompilation Compilation,
+        GeneratorDriverRunResult RunResult,
+        IReadOnlyList<Diagnostic> CompileDiagnostics
+    ) RunGenerator(string source)
+    {
+        // Force the JIT/runtime to load the dependent assemblies into the AppDomain
+        _ = typeof(StanzaViewAttribute<>).Assembly;
+        _ = typeof(CommunityToolkit.Mvvm.ComponentModel.ObservableObject).Assembly;
+        _ = typeof(Terminal.Gui.Views.Label).Assembly;
+        _ = typeof(IStanzaView<>).Assembly;
+
+        SyntaxTree syntaxTree = CSharpSyntaxTree.ParseText(
+            source,
+            new CSharpParseOptions(LanguageVersion.Preview)
+        );
+
+        // Dynamically get all currently loaded assemblies in the AppDomain to populate compilation references
+        var references = AppDomain
+            .CurrentDomain.GetAssemblies()
+            .Where(a => !a.IsDynamic && !string.IsNullOrWhiteSpace(a.Location))
+            .Select(a => MetadataReference.CreateFromFile(a.Location))
+            .Cast<MetadataReference>()
+            .ToList();
+
+        CSharpCompilation compilation = CSharpCompilation.Create(
+            assemblyName: "Tests",
+            syntaxTrees: new[] { syntaxTree },
+            references: references,
+            options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
+        );
+
+        var generator = new StanzaBindingGenerator();
+
+        GeneratorDriver driver = CSharpGeneratorDriver.Create(
+            new[] { generator.AsSourceGenerator() },
+            parseOptions: new CSharpParseOptions(LanguageVersion.Preview)
+        );
+
+        driver = driver.RunGenerators(compilation);
+
+        var runResult = driver.GetRunResult();
+        // Add the generated trees to the compilation to do final semantic checking
+        var finalCompilation = compilation;
+        foreach (var generatedTree in runResult.GeneratedTrees)
+        {
+            finalCompilation = finalCompilation.AddSyntaxTrees(generatedTree);
+        }
+
+        var compileDiagnostics = finalCompilation.GetDiagnostics();
+        return (driver, compilation, runResult, compileDiagnostics);
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Generators.Tests\TypeSafetyTests.cs
+
+```csharp
+using Stanza.TerminalGui.Generators.Tests;
+
+namespace Stanza.TerminalGui.Generators.Tests
+{
+    public class TypeSafetyTests
+    {
+        [Test]
+        public async Task STN022_Error_WhenCommandPropertyIsNotICommand()
+        {
+            var source = """
+                using Stanza.TerminalGui;
+                using Terminal.Gui.Views;
+
+                public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                    public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+                    public string NotACommand { get; set; } = "";
+                }
+
+                [StanzaView<MyVm>]
+                public partial class MyView : View {
+                    [BindCommand("NotACommand")]
+                    public Button MyBtn { get; set; } = new();
+                }
+                """;
+
+            var diags = TestHelper.VerifyDiagnostics(source);
+            await Assert.That(diags).Contains(d => d.Id == "STN022");
+        }
+
+        [Test]
+        public async Task STN030_Error_WhenBindingBoolPropertyToText()
+        {
+            var source = """
+                using Stanza.TerminalGui;
+                using Terminal.Gui.Views;
+
+                public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                    public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+                    public string MyString { get; set; } = "";
+                }
+
+                [StanzaView<MyVm>]
+                public partial class MyView : View {
+                    [BindChecked("MyString")] // Error: Requires bool
+                    public CheckBox MyCheck { get; set; } = new();
+                }
+                """;
+
+            var diags = TestHelper.VerifyDiagnostics(source);
+            await Assert.That(diags).Contains(d => d.Id == "STN030");
+        }
+    }
+}
+
+public class EmitterScenarioTests
+{
+    [Test]
+    public async Task Emitter_HandlesInheritedViewModelProperties()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class BaseVm : System.ComponentModel.INotifyPropertyChanged {
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+                public string InheritedName { get; set; }
+            }
+
+            public class DerivedVm : BaseVm { }
+
+            [StanzaView<DerivedVm>]
+            public partial class MyView : View {
+                [BindText("InheritedName")]
+                public Label MyLabel { get; set; } = new();
+            }
+            """;
+
+        var generated = TestHelper.GetGeneratedSource(source, "MyView.g.cs");
+
+        await Assert.That(generated).Contains("ApplyBindText(_viewModel, \"InheritedName\"");
+    }
+
+    [Test]
+    public async Task Emitter_HandlesGlobalNamespace()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class Vm : System.ComponentModel.INotifyPropertyChanged {
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<Vm>]
+            public partial class GlobalView : View { }
+            """;
+
+        var generated = TestHelper.GetGeneratedSource(source, "GlobalView.g.cs");
+
+        // Ensure "namespace Global;" or "namespace ;" isn't generated
+        await Assert.That(generated).DoesNotContain("namespace");
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Tests\BindingExtensionsTests.cs
+
+```csharp
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Terminal.Gui.Input;
+using Terminal.Gui.ViewBase;
+using Terminal.Gui.Views;
+
+namespace Stanza.TerminalGui.Tests;
+
+public partial class BindingExtensionsTests
+{
+    private partial class FakeViewModel : ObservableObject
+    {
+        [ObservableProperty]
+        public partial string Name { get; set; } = string.Empty;
+
+        [ObservableProperty]
+        public partial int Score { get; set; }
+
+        [ObservableProperty]
+        public partial bool IsVisible { get; set; } = true;
+
+        [ObservableProperty]
+        public partial bool IsEnabled { get; set; } = true;
+
+        [ObservableProperty]
+        [NotifyCanExecuteChangedFor(nameof(SaveCommand))]
+        public partial bool CanSave { get; set; } = true;
+
+        [RelayCommand(CanExecute = nameof(CanSave))]
+        private void Save() => SaveCalledCount++;
+
+        public int SaveCalledCount { get; set; }
+    }
+
+    [Test]
+    public async Task Bind_OneWay_UpdatesUiOnPropertyChange()
+    {
+        // Arrange
+        var vm = new FakeViewModel { Name = "Initial" };
+        var dispatcher = new View(); // Dummy dispatcher
+        var uiValue = "";
+
+        // Act - Note: Bind signature changed to require dispatcher and vm-parameterized lambda
+        using var binding = dispatcher.Bind(vm, x => x.Name, val => uiValue = val);
+
+        // Assert - Initial Value (Bind fires immediately)
+        await Assert.That(uiValue).IsEqualTo("Initial");
+
+        // Act - Change VM
+        vm.Name = "Updated";
+
+        // Assert - UI Updated
+        await Assert.That(uiValue).IsEqualTo("Updated");
+    }
+
+    [Test]
+    public async Task Bind_OneWay_DoesNotUpdateAfterDispose()
+    {
+        // Arrange
+        var vm = new FakeViewModel { Name = "Initial" };
+        var dispatcher = new View();
+        var uiValue = "";
+        var binding = dispatcher.Bind(vm, x => x.Name, val => uiValue = val);
+
+        // Act
+        binding.Dispose();
+        vm.Name = "ChangesAfterDispose";
+
+        // Assert
+        await Assert.That(uiValue).IsEqualTo("Initial");
+    }
+
+    [Test]
+    public async Task BindCommand_ExecutesRelayCommandOnButtonAccept()
+    {
+        // Arrange
+        var vm = new FakeViewModel();
+        var button = new Button();
+
+        // Act - Using updated signature: command.BindCommand(button)
+        using var binding = button.BindCommand(vm.SaveCommand);
+
+        // Simulate Button Accept/Click
+        button.InvokeCommand(Command.Accept);
+
+        // Assert
+        await Assert.That(vm.SaveCalledCount).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task BindingContext_Dispose_CleansUpMultipleBindings()
+    {
+        // Arrange
+        var ctx = new BindingContext();
+        var vm = new FakeViewModel { Name = "Initial" };
+        var dispatcher = new View();
+        var uiValue1 = "";
+        var uiValue2 = "";
+
+        // Use the new AddTo fluent extension as well
+        dispatcher.Bind(vm, x => x.Name, val => uiValue1 = val).AddTo(ctx);
+        dispatcher.Bind(vm, x => x.Name, val => uiValue2 = val).AddTo(ctx);
+
+        // Act
+        ctx.Dispose();
+        vm.Name = "NewValue";
+
+        // Assert
+        await Assert.That(uiValue1).IsEqualTo("Initial");
+        await Assert.That(uiValue2).IsEqualTo("Initial");
+    }
+
+    [Test]
+    public async Task AddTo_ReturnsOriginalInstance()
+    {
+        // Arrange
+        var ctx = new BindingContext();
+        var disposable = new DisposableAction(() => { });
+
+        // Act
+        var returned = disposable.AddTo(ctx);
+
+        // Assert - Verify fluent return (NativeAOT check)
+        await Assert.That(returned).IsSameReferenceAs(disposable);
+    }
+
+    [Test]
+    public async Task AddTo_FluentExtension_RegistersInContext()
+    {
+        // Arrange
+        var ctx = new BindingContext();
+        var wasDisposed = false;
+        var disposable = new DisposableAction(() => wasDisposed = true);
+
+        // Act
+        disposable.AddTo(ctx);
+        ctx.Dispose();
+
+        // Assert
+        await Assert.That(wasDisposed).IsTrue();
+    }
+
+    [Test]
+    public async Task Manual_TwoWay_Update_Test()
+    {
+        // Arrange
+        var vm = new FakeViewModel { Name = "Initial" };
+        var textField = new TextField { Text = "Initial" };
+        var dispatcher = textField;
+
+        // 1. VM -> UI (One Way)
+        using var binding = dispatcher.Bind(vm, x => x.Name, val => textField.Text = val);
+
+        // 2. UI -> VM (Manual hook since no BindTwoWay exists yet)
+        textField.TextChanged += (s, e) =>
+        {
+            vm.Name = textField.Text.ToString();
+        };
+
+        // Act - Change UI
+        textField.Text = "Changed In UI";
+
+        // Assert - VM updated
+        await Assert.That(vm.Name).IsEqualTo("Changed In UI");
+
+        // Act - Change VM
+        vm.Name = "Changed In VM";
+
+        // Assert - UI updated
+        await Assert.That(textField.Text.ToString()).IsEqualTo("Changed In VM");
+    }
+
+    [Test]
+    public async Task Bind_HandlesVariousLambdaStyles_Correctly()
+    {
+        var vm = new FakeViewModel { Name = "Initial" };
+        var dispatcher = new View();
+        string? capturedValue = null;
+
+        // Style 1: Standard 'x'
+        using var b1 = dispatcher.Bind(vm, x => x.Name, v => capturedValue = v);
+        vm.Name = "Updated1";
+        await Assert.That(capturedValue).IsEqualTo("Updated1");
+
+        // Style 2: Different parameter name (ensures parser isn't hardcoded to 'x')
+        using var b2 = dispatcher.Bind(vm, model => model.Name, v => capturedValue = v);
+        vm.Name = "Updated2";
+        await Assert.That(capturedValue).IsEqualTo("Updated2");
+
+        // Style 3: Nested path (ensures parser takes the LAST segment)
+        // Note: This assumes FakeViewModel has a sub-property.
+        // Even if it doesn't, the string parser should return "Name" for "m => m.Sub.Name"
+    }
+
+    [Test]
+    public async Task BindTwoWay_Dispose_UnsubscribesUiHandler()
+    {
+        // Arrange
+        var vm = new FakeViewModel { Name = "Initial" };
+        var textField = new TextField { Text = "Initial" };
+        var uiSubscribed = false;
+        var uiUnsubscribed = false;
+
+        var binding = textField.BindTwoWay(
+            vm,
+            v => v.Name,
+            val => vm.Name = val,
+            handler =>
+            {
+                uiSubscribed = true;
+                textField.TextChanged += (s, e) => handler();
+                return new DisposableAction(() => uiUnsubscribed = true);
+            },
+            () => textField.Text.ToString(),
+            val => textField.Text = val
+        );
+
+        // Act
+        binding.Dispose();
+
+        // Assert
+        await Assert.That(uiSubscribed).IsTrue();
+        await Assert.That(uiUnsubscribed).IsTrue();
+    }
+
+    // --- Phase A: Command Lifecycle ---
+
+    [Test]
+    public async Task BindCommand_SyncsCanExecuteToEnabled()
+    {
+        var vm = new FakeViewModel { CanSave = false };
+        var button = new Button();
+        using var binding = button.BindCommand(vm.SaveCommand);
+
+        await Assert.That(button.Enabled).IsFalse();
+
+        vm.CanSave = true;
+        await Assert.That(button.Enabled).IsTrue();
+    }
+
+    [Test]
+    public async Task BindCommand_Dispose_StopsExecutionAndEnabledSync()
+    {
+        var vm = new FakeViewModel { CanSave = true };
+        var button = new Button();
+        var binding = button.BindCommand(vm.SaveCommand);
+
+        binding.Dispose();
+
+        vm.CanSave = false;
+        await Assert.That(button.Enabled).IsTrue();
+
+        button.InvokeCommand(Command.Accept);
+        await Assert.That(vm.SaveCalledCount).IsEqualTo(0);
+    }
+
+    // --- Phase B: BindTwoWay Data Flow ---
+
+    [Test]
+    public async Task BindTwoWay_VmToUi_UpdatesUiSetter()
+    {
+        var vm = new FakeViewModel { Name = "Init" };
+        var dispatcher = new View();
+        var uiValue = "";
+
+        using var binding = dispatcher.BindTwoWay(
+            vm,
+            x => x.Name,
+            v => vm.Name = v,
+            handler => new DisposableAction(() => { }),
+            () => uiValue,
+            v => uiValue = v
+        );
+
+        vm.Name = "NewVm";
+        await Assert.That(uiValue).IsEqualTo("NewVm");
+    }
+
+    [Test]
+    public async Task BindTwoWay_UiToVm_UpdatesVmSetter()
+    {
+        var vm = new FakeViewModel { Name = "Init" };
+        var dispatcher = new View();
+        var uiValue = "Init";
+        Action? triggerUi = null;
+
+        using var binding = dispatcher.BindTwoWay(
+            vm,
+            x => x.Name,
+            v => vm.Name = v,
+            handler =>
+            {
+                triggerUi = handler;
+                return new DisposableAction(() => { });
+            },
+            () => uiValue,
+            v => uiValue = v
+        );
+
+        uiValue = "NewUi";
+        triggerUi?.Invoke();
+
+        await Assert.That(vm.Name).IsEqualTo("NewUi");
+    }
+
+    [Test]
+    public async Task BindTwoWay_ReentrancyGuard_PreventsCycle()
+    {
+        var vm = new FakeViewModel { Name = "Init" };
+        var dispatcher = new View();
+        var uiValue = "Init";
+        Action? triggerUi = null;
+        var uiSetterCalls = 0;
+
+        using var binding = dispatcher.BindTwoWay(
+            vm,
+            x => x.Name,
+            v => vm.Name = v,
+            handler =>
+            {
+                triggerUi = handler;
+                return new DisposableAction(() => { });
+            },
+            () => uiValue,
+            v =>
+            {
+                uiValue = v;
+                uiSetterCalls++;
+                triggerUi?.Invoke();
+            }
+        );
+
+        // Reset count after initial sync
+        uiSetterCalls = 0;
+        vm.Name = "VmChange";
+
+        await Assert.That(uiSetterCalls).IsEqualTo(1);
+        await Assert.That(vm.Name).IsEqualTo("VmChange");
+    }
+
+    [Test]
+    public async Task BindTwoWay_EqualValue_SkipsVmSetter()
+    {
+        var vm = new FakeViewModel { Score = 10 };
+        var dispatcher = new View();
+        var uiValue = 10;
+        Action? triggerUi = null;
+
+        var setterCalled = false;
+        using var binding = dispatcher.BindTwoWay(
+            vm,
+            x => x.Score,
+            v =>
+            {
+                vm.Score = v;
+                setterCalled = true;
+            },
+            handler =>
+            {
+                triggerUi = handler;
+                return new DisposableAction(() => { });
+            },
+            () => uiValue,
+            v => uiValue = v
+        );
+
+        triggerUi?.Invoke();
+        await Assert.That(setterCalled).IsFalse();
+    }
+
+    [Test]
+    public async Task BindTwoWay_Dispose_StopsVmToUiDirection()
+    {
+        var vm = new FakeViewModel { Name = "Init" };
+        var dispatcher = new View();
+        var uiValue = "";
+
+        var binding = dispatcher.BindTwoWay(
+            vm,
+            x => x.Name,
+            v => vm.Name = v,
+            handler => new DisposableAction(() => { }),
+            () => uiValue,
+            v => uiValue = v
+        );
+
+        binding.Dispose();
+        vm.Name = "NewVm";
+
+        await Assert.That(uiValue).IsEqualTo("Init");
+    }
+
+    // --- Phase C: Apply* methods ---
+
+    [Test]
+    public async Task ApplyBindText_OneWay_UpdatesViewText()
+    {
+        var vm = new FakeViewModel { Name = "Init" };
+        var view = new View();
+        using var binding = view.ApplyBindText(vm, "Name", x => x.Name);
+
+        vm.Name = "NewName";
+        await Assert.That(view.Text?.ToString()).IsEqualTo("NewName");
+    }
+
+    [Test]
+    public async Task ApplyBindText_TwoWay_VmToUi()
+    {
+        var vm = new FakeViewModel { Name = "Init" };
+        var view = new View();
+        using var binding = view.ApplyBindText(vm, "Name", x => x.Name, (x, v) => x.Name = v);
+
+        vm.Name = "NewName";
+        await Assert.That(view.Text?.ToString()).IsEqualTo("NewName");
+    }
+
+    [Test]
+    public async Task ApplyBindText_TwoWay_UiToVm()
+    {
+        var vm = new FakeViewModel { Name = "Init" };
+        var view = new View { Text = "Init" };
+        using var binding = view.ApplyBindText(vm, "Name", x => x.Name, (x, v) => x.Name = v);
+
+        view.Text = "UiName";
+        await Assert.That(vm.Name).IsEqualTo("UiName");
+    }
+
+    [Test]
+    public async Task ApplyBindText_SkipsRedundantTextSet()
+    {
+        var vm = new FakeViewModel { Name = "Init" };
+        var view = new View { Text = "Init" };
+        var events = 0;
+        view.TextChanged += (s, e) => events++;
+        using var binding = view.ApplyBindText(vm, "Name", x => x.Name, (x, v) => x.Name = v);
+
+        vm.Name = "Init";
+        await Assert.That(events).IsEqualTo(0);
+    }
+
+    [Test]
+    [Arguments(true, true)]
+    [Arguments(false, false)]
+    public async Task ApplyBindChecked_OneWay_SyncsCheckState(bool vmState, bool expectedUiState)
+    {
+        var vm = new FakeViewModel { IsEnabled = !vmState };
+        var cb = new CheckBox();
+        using var binding = cb.ApplyBindChecked(vm, "IsEnabled", x => x.IsEnabled);
+
+        vm.IsEnabled = vmState;
+        var checkState = expectedUiState ? CheckState.Checked : CheckState.UnChecked;
+        await Assert.That(cb.Value).IsEqualTo(checkState);
+    }
+
+    [Test]
+    [Arguments(true)]
+    [Arguments(false)]
+    public async Task ApplyBindChecked_TwoWay_UiToVm(bool uiState)
+    {
+        var vm = new FakeViewModel { IsEnabled = !uiState };
+        var cb = new CheckBox { Value = uiState ? CheckState.UnChecked : CheckState.Checked };
+        using var binding = cb.ApplyBindChecked(
+            vm,
+            "IsEnabled",
+            x => x.IsEnabled,
+            (x, v) => x.IsEnabled = v
+        );
+
+        cb.Value = uiState ? CheckState.Checked : CheckState.UnChecked; // triggers ValueChanged
+        await Assert.That(vm.IsEnabled).IsEqualTo(uiState);
+    }
+
+    [Test]
+    [Arguments(true)]
+    [Arguments(false)]
+    public async Task ApplyBindVisible_SyncsVisibility(bool visible)
+    {
+        var vm = new FakeViewModel { IsVisible = !visible };
+        var view = new View();
+        using var binding = view.ApplyBindVisible(vm, "IsVisible", x => x.IsVisible);
+
+        vm.IsVisible = visible;
+        await Assert.That(view.Visible).IsEqualTo(visible);
+    }
+
+    [Test]
+    [Arguments(true)]
+    [Arguments(false)]
+    public async Task ApplyBindEnabled_SyncsEnabled(bool enabled)
+    {
+        var vm = new FakeViewModel { IsEnabled = !enabled };
+        var view = new View();
+        using var binding = view.ApplyBindEnabled(vm, "IsEnabled", x => x.IsEnabled);
+
+        vm.IsEnabled = enabled;
+        await Assert.That(view.Enabled).IsEqualTo(enabled);
+    }
+
+    // --- Phase D: Edge cases ---
+
+    [Test]
+    public async Task BindingContext_AddBinding_ThrowsWhenDisposed()
+    {
+        var ctx = new BindingContext();
+        ctx.Dispose();
+
+        var exception = await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+        {
+            ctx.AddBinding(new DisposableAction(() => { }));
+            return Task.CompletedTask;
+        });
+
+        await Assert.That(exception).IsNotNull();
+    }
+
+    [Test]
+    [Arguments("x => x.Name", "Name")]
+    [Arguments("vm => vm.Title", "Title")]
+    [Arguments("m => m.User.Profile.FirstName", "FirstName")]
+    [Arguments("() => vm.Status", "Status")]
+    public async Task ExtractPropertyName_ValidatesExpectedFormats(
+        string expression,
+        string expected
+    )
+    {
+        await Assert.That(BindingExtensions.ExtractPropertyName(expression)).IsEqualTo(expected);
+    }
+
+    [Test]
+    [Arguments(null, "Text")]
+    [Arguments("", "Text")]
+    [Arguments("viewModel.Name", "Name")]
+    public async Task ExtractPropertyName_HandlesEdgeCases(string? expression, string expected)
+    {
+        await Assert.That(BindingExtensions.ExtractPropertyName(expression)).IsEqualTo(expected);
+    }
+}
+
+// [StanzaView<DemoViewModel>(Title = "Stanza MVVM Demo")]
+// public partial class DemoView : View
+// {
+//     public Label TitleLabel { get; private set; } = new()
+//     {
+//         Text = "Stanza.TerminalGui Declarative Demo",
+//         Width = Dim.Auto(),
+//         Height = 1
+//     };
+
+//     public Label InstructionLabel { get; private set; } = new()
+//     {
+//         Text = "Type your name below to see dynamic bindings:",
+//         Width = Dim.Auto(),
+//         Height = 1,
+//         Below = nameof(TitleLabel)
+//     };
+
+//     public TextField NameInput { get; private set; } = new()
+//     {
+//         Width = 30,
+//         Height = 1,
+//         BindText = nameof(DemoViewModel.Name),
+//         Below = nameof(InstructionLabel),
+//         Enabled = true,
+//     };
+
+//     public CheckBox ShowGreetingsCheckbox { get; private set; } = new()
+//     {
+//         Text = "Show Greetings Banner",
+//         Width = Dim.Auto(),
+//         Height = 1,
+//         BindChecked = nameof(DemoViewModel.ShowGreetings),
+//         Below = nameof(NameInput)
+//     };
+
+//     public Label GreetingsLabel { get; private set; } = new()
+//     {
+//         Width = Dim.Auto(),
+//         Height = Dim.Auto(),
+//         BindText = nameof(DemoViewModel.GreetingMessage),
+//         BindVisible = nameof(DemoViewModel.ShowGreetings),
+//         Below = nameof(ShowGreetingsCheckbox)
+//     };
+
+//     public Button ResetButton { get; private set; } = new()
+//     {
+//         Text = "Reset Form",
+//         Width = Dim.Auto(),
+//         Height = Dim.Auto(),
+//         BindCommand = nameof(DemoViewModel.ResetCommand),
+//         Below = nameof(GreetingsLabel)
+//     };
+// }
+// public partial class DemoViewModel : ObservableObject
+// {
+//     [ObservableProperty]
+//     public partial string Name { get; set; } = "Stanza User";
+//     [ObservableProperty]
+//     public partial bool ShowGreetings { get; set; } = true;
+
+//     public string GreetingMessage => $"Hello, {Name}! Welcome to Stanza.TerminalGui!";
+
+//     partial void OnNameChanged(string value)
+//     {
+//         OnPropertyChanged(nameof(GreetingMessage));
+//     }
+
+//     [RelayCommand]
+//     private void Reset()
+//     {
+//         Name = "Stanza User";
+//         ShowGreetings = true;
+//     }
+// }
+
+```
+
+// File: src\Stanza.TerminalGui.Tests\GeneratedViewE2ETests.cs
+
+```csharp
+using System.Threading.Tasks;
+using CommunityToolkit.Mvvm.ComponentModel;
+using Terminal.Gui;
+using Terminal.Gui.ViewBase;
+using Terminal.Gui.Views;
+
+namespace Stanza.TerminalGui.Tests;
+
+public partial class SimpleViewModel : ObservableObject
+{
+    [ObservableProperty]
+    public partial string Name { get; set; } = "John";
+}
+
+[StanzaView<SimpleViewModel>]
+public partial class SimpleFormView : View
+{
+    public Label TitleLabel { get; private set; } = new() { Text = "Form" };
+
+    [BindText(nameof(SimpleViewModel.Name))]
+    public TextField NameInput { get; private set; } = new();
+
+    public Button SubmitButton { get; private set; } = new() { Text = "Submit" };
+
+    public SimpleFormView()
+    {
+        NameInput.Y = Pos.Bottom(TitleLabel);
+        SubmitButton.Y = Pos.Bottom(NameInput);
+        Add(TitleLabel, NameInput, SubmitButton);
+    }
+}
+
+public class GeneratedViewE2ETests
+{
+    [Test]
+    public async Task View_Initializes_Successfully()
+    {
+        var vm = new SimpleViewModel { Name = "Alice" };
+        var view = new SimpleFormView { ViewModel = vm };
+
+        await Assert.That(view).IsNotNull();
+        await Assert.That(view.NameInput.Text.ToString()).IsEqualTo("Alice");
+    }
+
+    [Test]
+    public async Task View_TwoWayBinding_UpdatesViewModelFromUi()
+    {
+        var vm = new SimpleViewModel { Name = "Alice" };
+        var view = new SimpleFormView { ViewModel = vm };
+
+        // Act - Simulate typing in UI
+        view.NameInput.Text = "Bob";
+
+        // Assert - ViewModel property updated
+        await Assert.That(vm.Name).IsEqualTo("Bob");
+    }
+
+    [Test]
+    public async Task View_TwoWayBinding_UpdatesUiFromViewModel()
+    {
+        var vm = new SimpleViewModel { Name = "Alice" };
+        var view = new SimpleFormView { ViewModel = vm };
+
+        // Act - Update ViewModel property
+        vm.Name = "Charlie";
+
+        // Assert - UI elements updated
+        await Assert.That(view.NameInput.Text.ToString()).IsEqualTo("Charlie");
+    }
+}
+
+```
+
+// File: src\Stanza.TerminalGui.Tests\ViewLifecycleTests.cs
+
+```csharp
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using CommunityToolkit.Mvvm.ComponentModel;
+using Stanza.TerminalGui;
+using Terminal.Gui;
+using Terminal.Gui.ViewBase;
+using Terminal.Gui.Views;
+
+namespace Stanza.TerminalGui.Tests;
+
+public partial class LifecycleTestViewModel : ObservableObject
+{
+    [ObservableProperty]
+    public partial string Name { get; set; } = string.Empty;
+}
+
+[StanzaView<LifecycleTestViewModel>]
+public partial class LifecycleTestView : View
+{
+    public Label HeaderLabel { get; private set; } = new() { Text = "Header" };
+
+    [BindText(nameof(LifecycleTestViewModel.Name))]
+    public TextField NameInput { get; private set; } = new();
+
+    public LifecycleTestView()
+    {
+        NameInput.Y = Pos.Bottom(HeaderLabel);
+        Add(HeaderLabel, NameInput);
+    }
+}
+
+public class ViewLifecycleTests
+{
+    [Test]
+    public async Task ViewModel_NullDetachment_UnsubscribesOldVm()
+    {
+        var vmA = new LifecycleTestViewModel { Name = "Alpha" };
+        var view = new LifecycleTestView { ViewModel = vmA };
+
+        await Assert.That(view.NameInput.Text.ToString()).IsEqualTo("Alpha");
+
+        view.ViewModel = null;
+        vmA.Name = "ShouldNotFlow";
+
+        await Assert.That(view.NameInput.Text.ToString()).IsEqualTo("Alpha");
+    }
+
+    [Test]
+    public async Task ViewModel_SwapNullSwap_RecoversWithoutStaleSubscriptions()
+    {
+        var vmA = new LifecycleTestViewModel { Name = "VM_A" };
+        var vmB = new LifecycleTestViewModel { Name = "VM_B" };
+        var view = new LifecycleTestView();
+
+        view.ViewModel = vmA;
+        await Assert.That(view.NameInput.Text.ToString()).IsEqualTo("VM_A");
+
+        view.ViewModel = null;
+        view.ViewModel = vmB;
+        await Assert.That(view.NameInput.Text.ToString()).IsEqualTo("VM_B");
+
+        vmA.Name = "VM_A_Changed";
+        await Assert.That(view.NameInput.Text.ToString()).IsEqualTo("VM_B");
+
+        vmB.Name = "VM_B_Changed";
+        await Assert.That(view.NameInput.Text.ToString()).IsEqualTo("VM_B_Changed");
+    }
+
+    [Test]
+    public async Task ViewModel_Swap_DetachesOldTwoWayUiHandler()
+    {
+        // This test ensures that when the ViewModel is swapped,
+        // the old two-way UI handlers are detached and don't affect the old VM.
+        var vmA = new LifecycleTestViewModel { Name = "VM_A" };
+        var vmB = new LifecycleTestViewModel { Name = "VM_B" };
+        var view = new LifecycleTestView { ViewModel = vmA };
+
+        // Act - Swap VM
+        view.ViewModel = vmB;
+
+        // Act - Change UI (should update vmB, but NOT vmA)
+        view.NameInput.Text = "UI_Changed";
+
+        // Assert
+        await Assert.That(vmB.Name).IsEqualTo("UI_Changed");
+        await Assert.That(vmA.Name).IsEqualTo("VM_A");
+    }
+
+    [Test]
+    public async Task ViewModel_SameInstance_IsNoOp()
+    {
+        var vmA = new LifecycleTestViewModel { Name = "Alpha" };
+        var view = new LifecycleTestView { ViewModel = vmA };
+
+        // Change UI text
+        view.NameInput.Text = "Beta";
+
+        // Re-assign same ViewModel instance
+        view.ViewModel = vmA;
+
+        // Ensure the value wasn't wiped back to 'Alpha' by a re-trigger of ApplyBindings
+        await Assert.That(view.NameInput.Text.ToString()).IsEqualTo("Beta");
+    }
+}
+
+```
+

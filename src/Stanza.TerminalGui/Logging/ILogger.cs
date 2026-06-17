@@ -9,5 +9,8 @@ public interface ILogger
     /// Log the received message.
     /// </summary>
     /// <param name="message"></param>
-    void Log(string message);
+    void Log(LogLevel level, string message, string category);
+
+    // Explicitly forces exceptions to be handled as Errors
+    void LogError(Exception exception, string message, string category);
 }

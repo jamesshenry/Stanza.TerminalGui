@@ -16,24 +16,41 @@ partial class GlobalView : IStanzaView<GlobalViewModel>
         set
         {
             if (object.ReferenceEquals(_viewModel, value)) return;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel changed on GlobalView", LogLevel.Debug);
             _viewModel = value;
+            StanzaConfig.Trace($"[Lifecycle] ViewModel attached to GlobalView", LogLevel.Info); 
             ApplyBindings();
         }
+    }
+
+    object? IStanzaView.ViewModel 
+    { 
+        get => ViewModel; 
+        set => ViewModel = (GlobalViewModel?)value; 
     }
 
     partial void OnApplyBindings(BindingContext context);
     private void ApplyBindings()
     {
+        StanzaConfig.Trace("[Lifecycle] Disposing old bindings for GlobalView", LogLevel.Debug);
         _bindingContext.Dispose();
         _bindingContext = new BindingContext();
-        if (_viewModel == null) return;
+        if (_viewModel == null)
+        {
+            StanzaConfig.Trace("[Lifecycle] ViewModel is null for GlobalView, skipping bindings.", LogLevel.Debug);
+            return;
+        }
+        StanzaConfig.Trace("[Lifecycle] Applying 1 bindings for GlobalView...", LogLevel.Debug);
 
+        StanzaConfig.Trace("[Binding] Wiring StatusLabel (BindText) -> ViewModel.Status (Mode: TwoWay)", LogLevel.Debug);
         _bindingContext.AddBinding(StatusLabel.ApplyBindText(_viewModel, "Status", x => x.Status, (x, val) => x.Status = val));
+        StanzaConfig.Trace("[Lifecycle] Bindings applied successfully for GlobalView.", LogLevel.Debug);
         OnApplyBindings(_bindingContext);
     }
 
     protected override void Dispose(bool disposing)
     {
+        StanzaConfig.Trace($"[Lifecycle] Disposing GlobalView (disposing: {disposing})", LogLevel.Debug);
         if (disposing) _bindingContext.Dispose();
         base.Dispose(disposing);
     }

@@ -110,4 +110,24 @@ public static class StanzaDiagnostics
         defaultSeverity: DiagnosticSeverity.Warning,
         isEnabledByDefault: true
     );
+
+    // --- Smells & Safety (STN04x) ---
+
+    public static readonly DiagnosticDescriptor ViewModelMustImplementINPC = new(
+        id: "STN040",
+        title: "ViewModel must implement INotifyPropertyChanged",
+        messageFormat: "The ViewModel type '{0}' must implement INotifyPropertyChanged for bindings to work correctly",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    public static readonly DiagnosticDescriptor UnmanagedEventSubscription = new(
+        id: "STN041",
+        title: "Unmanaged event subscription",
+        messageFormat: "Manual event subscription detected in '{0}'. This will leak when the ViewModel is swapped or the View is disposed. Route subscriptions through 'BindingContext' or use '.AddTo(context)'.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true
+    );
 }

@@ -1,6 +1,9 @@
+using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Windows.Input;
+using Terminal.Gui;
+using Terminal.Gui.App;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 
@@ -46,6 +49,7 @@ public static class BindingExtensions
             if (string.Equals(e.PropertyName, propertyName, StringComparison.Ordinal))
             {
                 var newValue = propertyExpression(viewModel);
+                StanzaConfig.Trace($"[Binding] VM -> UI: {propertyName} = {newValue}");
 
                 if (view.App != null)
                     view.App.Invoke(() => updateUi(newValue));
@@ -105,7 +109,7 @@ public static class BindingExtensions
         TViewModel viewModel,
         Func<TViewModel, TValue> vmGetter,
         Action<TValue> vmSetter,
-        Action<Action> subscribeUiChange,
+        Func<Action, IDisposable> subscribeUiChange,
         Func<TValue> uiGetter,
         Action<TValue> uiSetter,
         [CallerArgumentExpression(nameof(vmGetter))] string? expression = null
@@ -155,12 +159,49 @@ public static class BindingExtensions
             }
         });
 
-        subscribeUiChange(uiHandler);
+        var uiSub = subscribeUiChange(uiHandler);
 
         return new DisposableAction(() =>
         {
             vmToUi.Dispose();
+            uiSub.Dispose();
         });
+    }
+
+    public static IDisposable OnEvent<TArgs>(
+        this View view,
+        Action<EventHandler<TArgs>> subscribe,
+        Action<EventHandler<TArgs>> unsubscribe,
+        Action<TArgs> handler
+    )
+    {
+        EventHandler<TArgs> wrapper = (s, e) => handler(e);
+        subscribe(wrapper);
+        return new DisposableAction(() => unsubscribe(wrapper));
+    }
+
+    public static IDisposable OnCollectionChanged(
+        this INotifyCollectionChanged collection,
+        NotifyCollectionChangedEventHandler handler
+    )
+    {
+        collection.CollectionChanged += handler;
+        return new DisposableAction(() => collection.CollectionChanged -= handler);
+    }
+
+    public static IDisposable OnPropertyChanged(
+        this INotifyPropertyChanged viewModel,
+        string propertyName,
+        Action handler
+    )
+    {
+        PropertyChangedEventHandler wrapper = (s, e) =>
+        {
+            if (e.PropertyName == propertyName)
+                handler();
+        };
+        viewModel.PropertyChanged += wrapper;
+        return new DisposableAction(() => viewModel.PropertyChanged -= wrapper);
     }
 
     #region Generator Apply Methods
@@ -183,9 +224,23 @@ public static class BindingExtensions
                 viewModel,
                 getter,
                 val => setter(viewModel, val?.ToString() ?? string.Empty),
-                handler => view.TextChanged += (s, e) => handler(),
+                handler =>
+                {
+                    EventHandler internalHandler = (s, e) => handler();
+                    view.TextChanged += internalHandler;
+                    return new DisposableAction(() => view.TextChanged -= internalHandler);
+                },
                 () => view.Text?.ToString() ?? string.Empty,
-                val => view.Text = val?.ToString() ?? string.Empty,
+                val =>
+                {
+                    var newText = val?.ToString() ?? string.Empty;
+                    // CRITICAL FIX: Only set if the text is actually different.
+                    // This prevents the cursor-reset loop.
+                    if (view.Text != newText)
+                    {
+                        view.Text = newText;
+                    }
+                },
                 propertyName
             );
         }
@@ -194,7 +249,14 @@ public static class BindingExtensions
             return view.Bind(
                 viewModel,
                 getter,
-                val => view.Text = val?.ToString() ?? string.Empty,
+                val =>
+                {
+                    var newText = val?.ToString() ?? string.Empty;
+                    if (view.Text != newText)
+                    {
+                        view.Text = newText;
+                    }
+                },
                 propertyName
             );
         }
@@ -218,7 +280,13 @@ public static class BindingExtensions
                 viewModel,
                 getter,
                 val => setter(viewModel, val),
-                handler => target.ValueChanged += (s, e) => handler(),
+                handler =>
+                {
+                    EventHandler<ValueChangedEventArgs<CheckState>> internalHandler = (s, e) =>
+                        handler();
+                    target.ValueChanged += internalHandler;
+                    return new DisposableAction(() => target.ValueChanged -= internalHandler);
+                },
                 () => target.Value == CheckState.Checked,
                 val => target.Value = val ? CheckState.Checked : CheckState.UnChecked,
                 propertyName

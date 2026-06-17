@@ -4,11 +4,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-
     <!-- Required for Analyzers/Generators -->
     <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
     <IsRoslynComponent>true</IsRoslynComponent>
-
     <!-- Packaging Settings -->
     <!-- This tells NuGet that this project doesn't provide a runtime library -->
     <IncludeBuildOutput>false</IncludeBuildOutput>
@@ -16,7 +14,6 @@
     <NoPackageAnalysis>true</NoPackageAnalysis>
     <!-- Marks the package as a development-only dependency -->
     <DevelopmentDependency>true</DevelopmentDependency>
-
     <PackageId>Stanza.TerminalGui.Generators</PackageId>
     <Authors>YourName</Authors>
     <Description>Source generator for Stanza.TerminalGui MVVM bindings.</Description>

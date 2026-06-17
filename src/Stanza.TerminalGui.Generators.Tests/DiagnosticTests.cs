@@ -170,4 +170,124 @@ public class DiagnosticTests
 
         await Assert.That(diags).Contains(d => d.Id == "STN012");
     }
+
+    [Test]
+    public async Task STN040_Error_WhenViewModelDoesNotImplementINPC()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class NotInpcVm { 
+                public string Name { get; set; } = "";
+            }
+
+            [StanzaView<NotInpcVm>]
+            public partial class MyView : View { }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN040");
+    }
+
+    [Test]
+    public async Task STN041_Warning_OnUnmanagedEventSubscriptionInCtor()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                public Button MyButton { get; set; } = new();
+                public MyView() {
+                    MyButton.Accepting += (s, e) => { }; // Smell!
+                }
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN041");
+    }
+
+    [Test]
+    public async Task STN041_Warning_OnUnmanagedSubscriptionInApplyBindings()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                public Button MyButton { get; set; } = new();
+                partial void OnApplyBindings(BindingContext context) {
+                    MyButton.Accepting += (s, e) => { }; // Smell!
+                }
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN041");
+    }
+
+    [Test]
+    public async Task STN041_NoError_WhenSubscriptionIsManaged()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                public Button MyButton { get; set; } = new();
+                partial void OnApplyBindings(BindingContext context) {
+                    // This is fine
+                    new System.Action(() => { }).AddTo(context);
+                }
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags.Any(d => d.Id == "STN041")).IsFalse();
+    }
+
+    [Test]
+    public async Task STN031_Error_WhenBindCheckedOnNonCheckBox()
+    {
+        var source = """
+            using Stanza.TerminalGui;
+            using Terminal.Gui.Views;
+
+            public class MyVm : System.ComponentModel.INotifyPropertyChanged { 
+                public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+                public bool IsActive { get; set; }
+            }
+
+            [StanzaView<MyVm>]
+            public partial class MyView : View {
+                [BindChecked(nameof(MyVm.IsActive))]
+                public Button MyButton { get; set; } = new(); // Invalid target for BindChecked
+            }
+            """;
+
+        var diags = TestHelper.VerifyDiagnostics(source);
+
+        await Assert.That(diags).Contains(d => d.Id == "STN031");
+    }
 }
