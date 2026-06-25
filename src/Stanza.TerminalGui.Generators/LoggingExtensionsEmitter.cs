@@ -19,10 +19,12 @@ internal static class LoggingExtensionsEmitter
         sb.AppendLine("namespace Stanza.TerminalGui;");
         sb.AppendLine();
 
-        // Internal MEL adapter — stays private to the consumer's compilation
+        // file-scoped: MelLoggerAdapter is an implementation detail used only within this
+        // generated file. file modifier prevents it ever being visible outside, including
+        // to test assemblies that receive internals via InternalsVisibleTo.
         sb.Append(
             """
-internal sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
+file sealed class MelLoggerAdapter : global::Stanza.TerminalGui.ILogger
 {
     private readonly global::Microsoft.Extensions.Logging.ILoggerFactory _factory;
 
