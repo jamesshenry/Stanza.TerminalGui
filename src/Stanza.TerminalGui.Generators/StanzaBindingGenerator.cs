@@ -46,6 +46,21 @@ public class StanzaBindingGenerator : IIncrementalGenerator
                     != null;
                 var hasHost =
                     compilation.GetTypeByMetadataName("Microsoft.Extensions.Hosting.IHost") != null;
+
+                // Skip generation if StanzaLoggingExtensions already exists in a referenced
+                // assembly and is accessible to this compilation (e.g. via InternalsVisibleTo
+                // from an app project). Re-generating would produce CS0436/CS0121 errors.
+                // We check StanzaLoggingExtensions (internal, always findable) rather than
+                // MelLoggerAdapter (file-scoped, compiler-mangled name, not findable by metadata name).
+                var existingLoggingExtensions = compilation.GetTypeByMetadataName(
+                    "Stanza.TerminalGui.StanzaLoggingExtensions"
+                );
+                if (
+                    existingLoggingExtensions != null
+                    && existingLoggingExtensions.ContainingAssembly.Name != compilation.AssemblyName
+                )
+                    hasLogging = false;
+
                 return (hasLogging, hasHost);
             }
         );
