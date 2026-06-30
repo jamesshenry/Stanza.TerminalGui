@@ -5,7 +5,7 @@
   <ItemGroup>
     <PackageVersion Include="CommunityToolkit.Mvvm" Version="8.4.2" />
     <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.9" />
-    <PackageVersion Include="Terminal.Gui" Version="2.4.11" />
+    <PackageVersion Include="Terminal.Gui" Version="2.0.1" />
     <PackageVersion Include="TUnit" Version="1.56.35" />
     <PackageVersion Include="Verify" Version="31.20.0" />
     <PackageVersion Include="Verify.SourceGenerators" Version="2.5.0" />
